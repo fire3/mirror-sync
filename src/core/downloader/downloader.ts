@@ -6,7 +6,8 @@ import pLimit from 'p-limit';
 
 import type {DownloadPlan, DownloadPlanEntry, DownloaderOptions, DownloadSummary} from '../../shared/types.js';
 
-const DEFAULT_USER_AGENT = 'mirror-sync/0.1';
+const DEFAULT_USER_AGENT =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36';
 
 async function verifyHash(entry: DownloadPlanEntry): Promise<void> {
   if (!entry.hash) {

@@ -1,5 +1,5 @@
-import {join} from 'node:path';
 import {readFile} from 'node:fs/promises';
+import {join} from 'node:path';
 
 import {executeDownloadPlan} from '../core/downloader/downloader.js';
 import {buildDownloadPlan} from '../core/planner/download-plan.js';
@@ -8,8 +8,16 @@ import {writeJsonFile} from '../core/storage/jsonl.js';
 import {fetchAndWritePackageList} from '../providers/pypi/fetch-package-list.js';
 import {fetchPackageMetadata} from '../providers/pypi/fetch-package-metadata.js';
 import {buildManifestFromSnapshot} from '../providers/pypi/manifest-builder.js';
-import type {AppConfig, SnapshotManifest, SyncRunResult} from '../shared/types.js';
-import {buildSnapshotId, buildSnapshotRoot, getLatestManifestPath, normalizeConfig} from './config.js';
+import type {AppConfig, DownloadPlan, PypiTaskType, SnapshotManifest, SyncRunResult} from '../shared/types.js';
+import {
+  DEFAULT_BROWSER_USER_AGENT,
+  buildManifestPath,
+  buildMirrorOutputRoot,
+  buildPlanPathFromMetadataDate,
+  buildSnapshotRoot,
+  normalizeConfig,
+  taskLabel
+} from './config.js';
 
 export interface SyncEvent {
   stage: string;
@@ -21,11 +29,7 @@ interface RunSyncOptions {
   onEvent?: ((event: SyncEvent) => void) | undefined;
 }
 
-function emit(
-  onEvent: ((event: SyncEvent) => void) | undefined,
-  stage: string,
-  message: string
-): void {
+function emit(onEvent: ((event: SyncEvent) => void) | undefined, stage: string, message: string): void {
   onEvent?.({stage, message});
 }
 
@@ -33,97 +37,201 @@ async function readJsonFile<T>(path: string): Promise<T> {
   return JSON.parse(await readFile(path, 'utf8')) as T;
 }
 
-export async function runSync(options: RunSyncOptions): Promise<SyncRunResult> {
-  const config = normalizeConfig(options.config);
-  const snapshotId = buildSnapshotId();
-  const snapshotRoot = buildSnapshotRoot(config.metadataRoot, snapshotId);
-  const previousManifestPath = await getLatestManifestPath(config.metadataRoot);
+async function loadManifestByDate(metadataRoot: string, metadataDate: string): Promise<SnapshotManifest> {
+  const manifestPath = buildManifestPath(metadataRoot, metadataDate);
+  return readJsonFile<SnapshotManifest>(manifestPath);
+}
+
+async function writePlan(metadataRoot: string, metadataDate: string, fileName: string, plan: DownloadPlan): Promise<string> {
+  const outputPath = buildPlanPathFromMetadataDate(metadataRoot, metadataDate, fileName);
+  await writeJsonFile(outputPath, plan);
+  return outputPath;
+}
+
+async function runMetadataSyncTask(
+  config: AppConfig,
+  onEvent: RunSyncOptions['onEvent']
+): Promise<SyncRunResult> {
+  const snapshotId = config.pypi.metadataSync.snapshotDate;
+  const snapshotRoot = buildSnapshotRoot(config.base.metadataRoot, snapshotId);
   const packageListPath = join(snapshotRoot, 'package-list.txt');
 
-  emit(options.onEvent, 'Prepare', `Using profile ${config.profileName}`);
-  emit(options.onEvent, 'Fetch /simple/', `Fetching package list from ${config.simpleUrl}`);
-  const packageNames = await fetchAndWritePackageList(config.simpleUrl, packageListPath, config.userAgent);
-  emit(options.onEvent, 'Fetch /simple/', `Fetched ${packageNames.length} packages`);
+  emit(onEvent, 'Prepare', `PyPI / ${taskLabel('metadata-sync')}`);
+  emit(onEvent, 'Fetch /simple/', `Fetching package list from ${config.base.simpleUrl}`);
+  const packageNames = await fetchAndWritePackageList(config.base.simpleUrl, packageListPath, DEFAULT_BROWSER_USER_AGENT);
+  emit(onEvent, 'Fetch /simple/', `Fetched ${packageNames.length} packages`);
 
-  emit(options.onEvent, 'Download Metadata', 'Fetching package HTML and JSON metadata');
+  emit(onEvent, 'Download Metadata', `Writing snapshot into ${snapshotRoot}`);
   const metadataSummary = await fetchPackageMetadata({
-    simpleUrl: config.simpleUrl,
+    simpleUrl: config.base.simpleUrl,
     packageNames,
     snapshotRoot,
-    concurrency: config.concurrency,
-    userAgent: config.userAgent
+    concurrency: config.base.concurrency,
+    userAgent: DEFAULT_BROWSER_USER_AGENT
   });
   emit(
-    options.onEvent,
+    onEvent,
     'Download Metadata',
     `HTML ${metadataSummary.htmlSuccess}/${metadataSummary.packagesTotal}, JSON ${metadataSummary.jsonSuccess}/${metadataSummary.packagesTotal}`
   );
 
-  emit(options.onEvent, 'Build Manifest', 'Building normalized snapshot manifest');
+  emit(onEvent, 'Build Manifest', 'Building normalized snapshot manifest');
   const manifest = await buildManifestFromSnapshot({
     snapshotRoot,
-    simpleBaseUrl: config.simpleUrl
+    simpleBaseUrl: config.base.simpleUrl
   });
 
-  let previousManifest: SnapshotManifest | undefined;
-  if (previousManifestPath) {
-    emit(options.onEvent, 'Compare / Plan', `Comparing with previous snapshot ${previousManifestPath}`);
-    previousManifest = await readJsonFile<SnapshotManifest>(previousManifestPath);
-  } else {
-    emit(options.onEvent, 'Compare / Plan', 'No previous snapshot found, using full sync plan');
-  }
-
-  const diff = previousManifest ? diffSnapshotManifests(previousManifest, manifest) : undefined;
-  const plan =
-    previousManifest && diff
-      ? buildDownloadPlan({
-          mirrorRoot: config.mirrorRoot,
-          newManifest: manifest,
-          diff
-        })
-      : buildDownloadPlan({
-          mirrorRoot: config.mirrorRoot,
-          newManifest: manifest
-        });
-
-  const planPath = join(snapshotRoot, 'download-plan.json');
-  await writeJsonFile(planPath, plan);
-  emit(options.onEvent, 'Compare / Plan', `Planned ${plan.entries.length} downloads`);
-
-  let downloadSummary: SyncRunResult['downloadSummary'];
-  if (config.downloadArtifacts) {
-    emit(options.onEvent, 'Download', 'Downloading artifacts');
-    downloadSummary = await executeDownloadPlan(plan, {
-      concurrency: config.concurrency,
-      retry: config.retry,
-      timeoutMs: config.timeoutMs,
-      userAgent: config.userAgent
-    });
-    emit(
-      options.onEvent,
-      'Download',
-      `Downloaded ${downloadSummary.downloaded}/${downloadSummary.attempted}, failed ${downloadSummary.failed.length}`
-    );
-  } else {
-    emit(options.onEvent, 'Download', 'Artifact download disabled, plan only');
-  }
-
-  await writeJsonFile(join(config.metadataRoot, 'current.json'), {
+  await writeJsonFile(join(config.base.metadataRoot, 'current.json'), {
+    provider: 'pypi',
+    taskType: 'metadata-sync',
     snapshotId,
     snapshotRoot,
-    manifestPath: join(snapshotRoot, 'manifest.json'),
-    planPath
+    manifestPath: buildManifestPath(config.base.metadataRoot, snapshotId)
   });
 
-  emit(options.onEvent, 'Finalize', `Snapshot ${snapshotId} completed`);
-
+  emit(onEvent, 'Finalize', `Snapshot ${snapshotId} completed`);
   return {
+    provider: 'pypi',
+    taskType: 'metadata-sync',
     snapshotId,
     snapshotRoot,
     packageCount: packageNames.length,
+    manifest
+  };
+}
+
+async function runArtifactDownloadTask(
+  config: AppConfig,
+  onEvent: RunSyncOptions['onEvent']
+): Promise<SyncRunResult> {
+  const metadataDate = config.pypi.artifactDownload.metadataDate;
+  const outputDate = config.pypi.artifactDownload.outputDate;
+  const manifest = await loadManifestByDate(config.base.metadataRoot, metadataDate);
+  const outputRoot = buildMirrorOutputRoot(config.base.mirrorRoot, outputDate);
+
+  emit(onEvent, 'Prepare', `PyPI / ${taskLabel('artifact-download')}`);
+  emit(onEvent, 'Load Manifest', `Loading manifest from metadata date ${metadataDate}`);
+
+  const plan = buildDownloadPlan({
+    mirrorRoot: outputRoot,
+    newManifest: manifest
+  });
+  const planPath = await writePlan(config.base.metadataRoot, metadataDate, `download-plan-${outputDate}.json`, plan);
+  emit(onEvent, 'Build Plan', `Planned ${plan.entries.length} downloads -> ${outputRoot}`);
+
+  const downloadSummary = await executeDownloadPlan(plan, {
+    concurrency: config.base.concurrency,
+    retry: config.base.retry,
+    timeoutMs: config.base.timeoutMs,
+    userAgent: DEFAULT_BROWSER_USER_AGENT
+  });
+  emit(
+    onEvent,
+    'Download',
+    `Downloaded ${downloadSummary.downloaded}/${downloadSummary.attempted}, failed ${downloadSummary.failed.length}`
+  );
+
+  await writeJsonFile(join(outputRoot, 'run-summary.json'), {
+    provider: 'pypi',
+    taskType: 'artifact-download',
+    metadataDate,
+    outputDate,
+    outputRoot,
+    planPath
+  });
+
+  emit(onEvent, 'Finalize', `Artifact download completed into ${outputRoot}`);
+  return {
+    provider: 'pypi',
+    taskType: 'artifact-download',
+    snapshotId: metadataDate,
     manifest,
     plan,
-    ...(diff ? {diff} : {}),
-    ...(downloadSummary ? {downloadSummary} : {})
+    downloadSummary,
+    outputRoot
   };
+}
+
+async function runIncrementalDownloadTask(
+  config: AppConfig,
+  onEvent: RunSyncOptions['onEvent']
+): Promise<SyncRunResult> {
+  const oldMetadataDate = config.pypi.incrementalDownload.oldMetadataDate;
+  const newMetadataDate = config.pypi.incrementalDownload.newMetadataDate;
+  const outputDate = config.pypi.incrementalDownload.outputDate;
+  const [oldManifest, newManifest] = await Promise.all([
+    loadManifestByDate(config.base.metadataRoot, oldMetadataDate),
+    loadManifestByDate(config.base.metadataRoot, newMetadataDate)
+  ]);
+  const outputRoot = buildMirrorOutputRoot(config.base.mirrorRoot, outputDate);
+
+  emit(onEvent, 'Prepare', `PyPI / ${taskLabel('incremental-download')}`);
+  emit(onEvent, 'Load Manifest', `Comparing ${oldMetadataDate} -> ${newMetadataDate}`);
+  const diff = diffSnapshotManifests(oldManifest, newManifest);
+  const plan = buildDownloadPlan({
+    mirrorRoot: outputRoot,
+    newManifest,
+    diff
+  });
+  const planPath = await writePlan(
+    config.base.metadataRoot,
+    newMetadataDate,
+    `incremental-plan-${oldMetadataDate}-to-${outputDate}.json`,
+    plan
+  );
+  emit(onEvent, 'Build Plan', `Planned ${plan.entries.length} incremental downloads -> ${outputRoot}`);
+
+  const downloadSummary = await executeDownloadPlan(plan, {
+    concurrency: config.base.concurrency,
+    retry: config.base.retry,
+    timeoutMs: config.base.timeoutMs,
+    userAgent: DEFAULT_BROWSER_USER_AGENT
+  });
+  emit(
+    onEvent,
+    'Download',
+    `Downloaded ${downloadSummary.downloaded}/${downloadSummary.attempted}, failed ${downloadSummary.failed.length}`
+  );
+
+  await writeJsonFile(join(outputRoot, 'run-summary.json'), {
+    provider: 'pypi',
+    taskType: 'incremental-download',
+    oldMetadataDate,
+    newMetadataDate,
+    outputDate,
+    outputRoot,
+    planPath
+  });
+
+  emit(onEvent, 'Finalize', `Incremental download completed into ${outputRoot}`);
+  return {
+    provider: 'pypi',
+    taskType: 'incremental-download',
+    snapshotId: newMetadataDate,
+    manifest: newManifest,
+    plan,
+    diff,
+    downloadSummary,
+    outputRoot
+  };
+}
+
+async function runPypiTask(
+  taskType: PypiTaskType,
+  config: AppConfig,
+  onEvent: RunSyncOptions['onEvent']
+): Promise<SyncRunResult> {
+  switch (taskType) {
+    case 'metadata-sync':
+      return runMetadataSyncTask(config, onEvent);
+    case 'artifact-download':
+      return runArtifactDownloadTask(config, onEvent);
+    case 'incremental-download':
+      return runIncrementalDownloadTask(config, onEvent);
+  }
+}
+
+export async function runSync(options: RunSyncOptions): Promise<SyncRunResult> {
+  const config = normalizeConfig(options.config);
+  return runPypiTask(config.selectedTask, config, options.onEvent);
 }

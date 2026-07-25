@@ -85,24 +85,61 @@ export interface DownloadSummary {
   failed: Array<{entry: DownloadPlanEntry; error: string}>;
 }
 
-export interface AppConfig {
+export type ProviderType = 'pypi';
+export type PypiTaskType = 'metadata-sync' | 'artifact-download' | 'incremental-download';
+
+export interface BaseAppConfig {
   profileName: string;
+  provider: ProviderType;
   simpleUrl: string;
   metadataRoot: string;
   mirrorRoot: string;
   concurrency: number;
   retry: number;
   timeoutMs: number;
-  userAgent: string;
-  downloadArtifacts: boolean;
+}
+
+export interface MetadataSyncTaskConfig {
+  snapshotDate: string;
+}
+
+export interface ArtifactDownloadTaskConfig {
+  metadataDate: string;
+  outputDate: string;
+}
+
+export interface IncrementalDownloadTaskConfig {
+  oldMetadataDate: string;
+  newMetadataDate: string;
+  outputDate: string;
+}
+
+export interface PypiTaskConfigs {
+  metadataSync: MetadataSyncTaskConfig;
+  artifactDownload: ArtifactDownloadTaskConfig;
+  incrementalDownload: IncrementalDownloadTaskConfig;
+}
+
+export interface AppConfig {
+  base: BaseAppConfig;
+  selectedTask: PypiTaskType;
+  pypi: PypiTaskConfigs;
+}
+
+export interface TaskExecutionContext {
+  provider: ProviderType;
+  taskType: PypiTaskType;
 }
 
 export interface SyncRunResult {
-  snapshotId: string;
-  snapshotRoot: string;
-  packageCount: number;
-  manifest: SnapshotManifest;
-  plan: DownloadPlan;
+  provider: ProviderType;
+  taskType: PypiTaskType;
+  snapshotId?: string | undefined;
+  snapshotRoot?: string | undefined;
+  packageCount?: number | undefined;
+  manifest?: SnapshotManifest | undefined;
+  plan?: DownloadPlan | undefined;
   diff?: SnapshotDiff | undefined;
   downloadSummary?: DownloadSummary | undefined;
+  outputRoot?: string | undefined;
 }
