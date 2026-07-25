@@ -175,7 +175,7 @@ export function buildPlanPathFromMetadataDate(metadataRoot: string, metadataDate
 }
 
 export function buildSnapshotId(now = new Date()): string {
-  return now.toISOString().replaceAll(':', '-').replaceAll('.', '-');
+  return now.toISOString().split('T')[0]!;
 }
 
 export function taskLabel(taskType: PypiTaskType): string {
