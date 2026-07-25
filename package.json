@@ -1,0 +1,30 @@
+{
+  "name": "mirror-sync",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start": "tsx src/app/cli.ts",
+    "tui": "tsx src/app/tui.tsx"
+  },
+  "dependencies": {
+    "commander": "^14.0.0",
+    "ink": "^6.3.1",
+    "ink-text-input": "^6.0.0",
+    "p-limit": "^7.1.1",
+    "react": "^19.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@types/react": "^19.1.10",
+    "tsx": "^4.20.4",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

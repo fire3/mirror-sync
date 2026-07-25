@@ -1,0 +1,6 @@
+.tools/
+dist/
+node_modules/
+coverage/
+*.log
+*.tmp
