@@ -18,15 +18,22 @@ import {
   normalizeConfig,
   taskLabel
 } from './config.js';
+import type {TaskController} from './task-controller.js';
 
 export interface SyncEvent {
   stage: string;
   message: string;
+  progress?: {
+    current: number;
+    total: number;
+    failed: number;
+  };
 }
 
 interface RunSyncOptions {
   config: AppConfig;
   onEvent?: ((event: SyncEvent) => void) | undefined;
+  taskController?: TaskController;
 }
 
 function emit(onEvent: ((event: SyncEvent) => void) | undefined, stage: string, message: string): void {
@@ -102,7 +109,8 @@ async function runMetadataSyncTask(
 
 async function runArtifactDownloadTask(
   config: AppConfig,
-  onEvent: RunSyncOptions['onEvent']
+  onEvent: RunSyncOptions['onEvent'],
+  taskController?: TaskController
 ): Promise<SyncRunResult> {
   const metadataDate = config.pypi.artifactDownload.metadataDate;
   const outputDate = config.pypi.artifactDownload.outputDate;
@@ -123,7 +131,15 @@ async function runArtifactDownloadTask(
     concurrency: config.base.concurrency,
     retry: config.base.retry,
     timeoutMs: config.base.timeoutMs,
-    userAgent: DEFAULT_BROWSER_USER_AGENT
+    userAgent: DEFAULT_BROWSER_USER_AGENT,
+    taskController,
+    onProgress: (current, failed, total) => {
+      onEvent?.({
+        stage: 'Download',
+        message: `Downloading ${current}/${total} (Failed: ${failed})`,
+        progress: { current, total, failed }
+      });
+    }
   });
   emit(
     onEvent,
@@ -154,7 +170,8 @@ async function runArtifactDownloadTask(
 
 async function runIncrementalDownloadTask(
   config: AppConfig,
-  onEvent: RunSyncOptions['onEvent']
+  onEvent: RunSyncOptions['onEvent'],
+  taskController?: TaskController
 ): Promise<SyncRunResult> {
   const oldMetadataDate = config.pypi.incrementalDownload.oldMetadataDate;
   const newMetadataDate = config.pypi.incrementalDownload.newMetadataDate;
@@ -185,7 +202,15 @@ async function runIncrementalDownloadTask(
     concurrency: config.base.concurrency,
     retry: config.base.retry,
     timeoutMs: config.base.timeoutMs,
-    userAgent: DEFAULT_BROWSER_USER_AGENT
+    userAgent: DEFAULT_BROWSER_USER_AGENT,
+    taskController,
+    onProgress: (current, failed, total) => {
+      onEvent?.({
+        stage: 'Download',
+        message: `Downloading ${current}/${total} (Failed: ${failed})`,
+        progress: { current, total, failed }
+      });
+    }
   });
   emit(
     onEvent,
@@ -219,19 +244,20 @@ async function runIncrementalDownloadTask(
 async function runPypiTask(
   taskType: PypiTaskType,
   config: AppConfig,
-  onEvent: RunSyncOptions['onEvent']
+  onEvent: RunSyncOptions['onEvent'],
+  taskController?: TaskController
 ): Promise<SyncRunResult> {
   switch (taskType) {
     case 'metadata-sync':
       return runMetadataSyncTask(config, onEvent);
     case 'artifact-download':
-      return runArtifactDownloadTask(config, onEvent);
+      return runArtifactDownloadTask(config, onEvent, taskController);
     case 'incremental-download':
-      return runIncrementalDownloadTask(config, onEvent);
+      return runIncrementalDownloadTask(config, onEvent, taskController);
   }
 }
 
 export async function runSync(options: RunSyncOptions): Promise<SyncRunResult> {
   const config = normalizeConfig(options.config);
-  return runPypiTask(config.selectedTask, config, options.onEvent);
+  return runPypiTask(config.selectedTask, config, options.onEvent, options.taskController);
 }

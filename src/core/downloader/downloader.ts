@@ -89,23 +89,36 @@ export async function executeDownloadPlan(
   const limit = pLimit(options.concurrency);
   const failed: Array<{entry: DownloadPlanEntry; error: string}> = [];
   let downloaded = 0;
+  const total = plan.entries.length;
+
+  const updateProgress = () => {
+    options.onProgress?.(downloaded, failed.length, total);
+  };
 
   await Promise.all(
     plan.entries.map((entry) =>
       limit(async () => {
+        if (options.taskController) {
+          await options.taskController.check();
+        }
+
         try {
           const destinationStats = await stat(entry.destinationPath).catch(() => undefined);
           if (destinationStats && destinationStats.size > 0) {
+            downloaded += 1;
+            updateProgress();
             return;
           }
 
           await fetchWithRetry(entry, options);
           downloaded += 1;
+          updateProgress();
         } catch (error) {
           failed.push({
             entry,
             error: error instanceof Error ? error.message : String(error)
           });
+          updateProgress();
         }
       })
     )

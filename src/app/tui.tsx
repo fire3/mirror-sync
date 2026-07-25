@@ -4,6 +4,7 @@ import TextInput from 'ink-text-input';
 
 import {DEFAULT_CONFIG_PATH, defaultConfig, loadConfig, normalizeConfig, saveConfig, taskLabel} from './config.js';
 import {runSync, type SyncEvent} from './run-sync.js';
+import {TaskController} from './task-controller.js';
 import type {
   AppConfig,
   BaseAppConfig,
@@ -150,6 +151,8 @@ function InteractiveApp(): React.JSX.Element {
   const [status, setStatus] = useState('Loading config...');
   const [logs, setLogs] = useState<string[]>([]);
   const [lastResult, setLastResult] = useState<SyncRunResult | undefined>();
+  const [taskController, setTaskController] = useState<TaskController | undefined>();
+  const [progressData, setProgressData] = useState<{current: number; total: number; failed: number} | undefined>();
 
   const selectedTask = TASK_DEFINITIONS[taskIndex] ?? TASK_DEFINITIONS[0]!;
   const baseField = BASE_FIELDS[baseFieldIndex];
@@ -203,6 +206,9 @@ function InteractiveApp(): React.JSX.Element {
   const runCurrentTask = async (): Promise<void> => {
     setRunning(true);
     setLastResult(undefined);
+    setProgressData(undefined);
+    const controller = new TaskController();
+    setTaskController(controller);
     setLogs((current) => appendLog(current, `[run] provider=pypi task=${config.selectedTask}`));
 
     try {
@@ -211,9 +217,14 @@ function InteractiveApp(): React.JSX.Element {
       await saveConfig(normalized);
       const result = await runSync({
         config: normalized,
+        taskController: controller,
         onEvent: (event: SyncEvent) => {
           setStatus(`${event.stage}: ${event.message}`);
-          setLogs((current) => appendLog(current, `[${event.stage}] ${event.message}`));
+          if (event.progress) {
+            setProgressData(event.progress);
+          } else {
+            setLogs((current) => appendLog(current, `[${event.stage}] ${event.message}`));
+          }
         }
       });
       setLastResult(result);
@@ -226,6 +237,7 @@ function InteractiveApp(): React.JSX.Element {
       setLogs((current) => appendLog(current, `[error] ${message}`));
     } finally {
       setRunning(false);
+      setTaskController(undefined);
     }
   };
 
@@ -236,7 +248,29 @@ function InteractiveApp(): React.JSX.Element {
     }
 
     if (running) {
+      if (input === 'p') {
+        if (taskController) {
+          if (taskController.isPaused()) {
+            taskController.resume();
+            setStatus('Resumed');
+          } else {
+            taskController.pause();
+            setStatus('Paused');
+          }
+        }
+        return;
+      }
+      if (input === 'c') {
+        if (taskController) {
+          taskController.cancel();
+          setStatus('Cancelling...');
+        }
+        return;
+      }
       if (input === 'q') {
+        if (taskController) {
+          taskController.cancel();
+        }
         exit();
       }
       return;
@@ -398,170 +432,184 @@ function InteractiveApp(): React.JSX.Element {
     ];
   }, [lastResult]);
 
+  const renderProgressBar = () => {
+    if (!progressData || progressData.total === 0) {
+      return null;
+    }
+    const {current, total, failed} = progressData;
+    const percent = Math.min(100, Math.max(0, Math.floor((current / total) * 100)));
+    const barWidth = 40;
+    const filled = Math.floor((percent / 100) * barWidth);
+    const empty = barWidth - filled;
+    const bar = '█'.repeat(filled) + '░'.repeat(empty);
+    return (
+      <Box flexDirection="column" marginTop={1}>
+        <Text color="yellow">Download Progress</Text>
+        <Box>
+          <Text color={taskController?.isPaused() ? "yellow" : "cyan"}>{bar}</Text>
+          <Text> {percent}% </Text>
+          <Text dimColor>({current}/{total})</Text>
+          {failed > 0 && <Text color="red"> Failed: {failed}</Text>}
+        </Box>
+        {taskController?.isPaused() && <Text color="yellow">Task is PAUSED</Text>}
+      </Box>
+    );
+  };
+
   return (
-    <Box flexDirection="column" padding={1}>
-      <Text color="cyan">mirror-sync</Text>
-      <Text dimColor>Step 1 provider, Step 2 task, Step 3 config, Step 4 confirm and start</Text>
-      <Text dimColor>Config file: {DEFAULT_CONFIG_PATH}</Text>
-
-      <Box marginTop={1} flexDirection="column">
-        <Text color="yellow">Provider</Text>
-        {screen === 'provider' ? (
-          PROVIDERS.map((provider, index) => (
-            <Box key={provider.id} flexDirection="column">
-              <Box>
-                {index === providerIndex ? <Text color="green">&gt;</Text> : <Text> </Text>}
-                <Text> {provider.label}</Text>
-              </Box>
-              <Text dimColor>   {provider.description}</Text>
-            </Box>
-          ))
-        ) : (
-          <Text>PyPI</Text>
-        )}
+    <Box flexDirection="column" padding={1} width={80}>
+      <Box borderStyle="round" borderColor="cyan" paddingX={2} paddingY={1} flexDirection="column">
+        <Text color="cyan" bold>mirror-sync TUI</Text>
+        <Text dimColor>Step 1: Provider ➔ Step 2: Task ➔ Step 3: Config ➔ Step 4: Run</Text>
       </Box>
 
-      <Box marginTop={1} flexDirection="column">
-        <Text color="yellow">Task</Text>
-        {screen === 'task' ? (
-          TASK_DEFINITIONS.map((task, index) => (
-            <Box key={task.id} flexDirection="column">
-              <Box>
-                {index === taskIndex ? <Text color="green">&gt;</Text> : <Text> </Text>}
-                <Text> {task.label}</Text>
+      <Box marginTop={1} flexDirection="row">
+        {/* Left Column: Provider & Task */}
+        <Box flexDirection="column" width="40%" paddingRight={2}>
+          <Text color="yellow" bold>Provider</Text>
+          {screen === 'provider' ? (
+            PROVIDERS.map((provider, index) => (
+              <Box key={provider.id} flexDirection="column" marginTop={1}>
+                <Box>
+                  {index === providerIndex ? <Text color="green" bold>&gt; {provider.label}</Text> : <Text>  {provider.label}</Text>}
+                </Box>
+                <Text dimColor>  {provider.description}</Text>
               </Box>
-              <Text dimColor>   {task.description}</Text>
-            </Box>
-          ))
-        ) : (
-          <>
-            <Text>{getTaskDefinition(config.selectedTask).label}</Text>
-            <Text dimColor>{getTaskDefinition(config.selectedTask).description}</Text>
-          </>
-        )}
-      </Box>
+            ))
+          ) : (
+            <Text color="green">✔ PyPI</Text>
+          )}
 
-      <Box marginTop={1}>
-        <Box flexDirection="column" marginRight={4} width={58}>
-          <Text color="yellow">Base Config</Text>
-          {BASE_FIELDS.map((field, index) => {
-            const selected = screen === 'config' && configSection === 'base' && index === baseFieldIndex;
-            const editing = editingField === `base:${String(field.key)}`;
-            return (
-              <Box key={String(field.key)}>
-                {selected ? <Text color="green">&gt;</Text> : <Text> </Text>}
-                <Text> {field.label}: </Text>
-                {editing ? (
-                  <TextInput
-                    value={draftValue}
-                    onChange={setDraftValue}
-                    onSubmit={(value) => {
-                      setConfig((current) => ({
-                        ...current,
-                        base: {
-                          ...current.base,
-                          [field.key]:
-                            field.key === 'concurrency' || field.key === 'retry' || field.key === 'timeoutMs'
-                              ? Number.isFinite(Number(value.trim()))
-                                ? Number(value.trim())
-                                : current.base[field.key]
-                              : value
-                        }
-                      }));
-                      setEditingField(undefined);
-                      setDraftValue('');
-                      setStatus(`Updated base config: ${field.label}`);
-                    }}
-                  />
-                ) : selected ? (
-                  <Text color="green">{String(config.base[field.key])}</Text>
-                ) : (
-                  <Text>{String(config.base[field.key])}</Text>
-                )}
+          <Box marginTop={2}>
+            <Text color="yellow" bold>Task</Text>
+          </Box>
+          {screen === 'task' ? (
+            TASK_DEFINITIONS.map((task, index) => (
+              <Box key={task.id} flexDirection="column" marginTop={1}>
+                <Box>
+                  {index === taskIndex ? <Text color="green" bold>&gt; {task.label}</Text> : <Text>  {task.label}</Text>}
+                </Box>
+                <Text dimColor>  {task.description}</Text>
               </Box>
-            );
-          })}
+            ))
+          ) : screen !== 'provider' ? (
+            <Text color="green">✔ {getTaskDefinition(config.selectedTask).label}</Text>
+          ) : (
+            <Text dimColor>Pending...</Text>
+          )}
         </Box>
 
-        <Box flexDirection="column" width={58}>
-          <Text color="yellow">Task Config</Text>
-          {getTaskDefinition(config.selectedTask).taskFields.map((field, index) => {
-            const selected = screen === 'config' && configSection === 'task' && index === taskFieldIndex;
-            const editing = editingField === `task:${String(field.key)}`;
-            return (
-              <Box key={String(field.key)}>
-                {selected ? <Text color="green">&gt;</Text> : <Text> </Text>}
-                <Text> {field.label}: </Text>
-                {editing ? (
-                  <TextInput
-                    value={draftValue}
-                    onChange={setDraftValue}
-                    onSubmit={(value) => {
-                      setConfig((current) => writeTaskField(current, config.selectedTask, field, value));
-                      setEditingField(undefined);
-                      setDraftValue('');
-                      setStatus(`Updated task config: ${field.label}`);
-                    }}
-                  />
-                ) : selected ? (
-                  <Text color="green">{readTaskField(config, config.selectedTask, field)}</Text>
-                ) : (
-                  <Text>{readTaskField(config, config.selectedTask, field)}</Text>
-                )}
+        {/* Right Column: Config & Confirm */}
+        <Box flexDirection="column" width="60%">
+          <Text color="yellow" bold>Configuration</Text>
+          {screen === 'provider' || screen === 'task' ? (
+            <Text dimColor>Select provider and task first...</Text>
+          ) : (
+            <Box flexDirection="column" marginTop={1}>
+              <Text color="cyan" underline>Base Settings</Text>
+              {BASE_FIELDS.map((field, index) => {
+                const selected = screen === 'config' && configSection === 'base' && index === baseFieldIndex;
+                const editing = editingField === `base:${String(field.key)}`;
+                return (
+                  <Box key={String(field.key)}>
+                    <Box width={2}>
+                      {selected ? <Text color="green" bold>&gt;</Text> : <Text> </Text>}
+                    </Box>
+                    <Box width={18}>
+                      <Text>{field.label}:</Text>
+                    </Box>
+                    {editing ? (
+                      <TextInput
+                        value={draftValue}
+                        onChange={setDraftValue}
+                        onSubmit={(value) => {
+                          setConfig((current) => ({
+                            ...current,
+                            base: {
+                              ...current.base,
+                              [field.key]:
+                                field.key === 'concurrency' || field.key === 'retry' || field.key === 'timeoutMs'
+                                  ? Number.isFinite(Number(value.trim()))
+                                    ? Number(value.trim())
+                                    : current.base[field.key]
+                                  : value
+                            }
+                          }));
+                          setEditingField(undefined);
+                          setDraftValue('');
+                          setStatus(`Updated base config: ${field.label}`);
+                        }}
+                      />
+                    ) : selected ? (
+                      <Text color="green">{String(config.base[field.key])}</Text>
+                    ) : (
+                      <Text>{String(config.base[field.key])}</Text>
+                    )}
+                  </Box>
+                );
+              })}
+
+              <Box marginTop={1}>
+                <Text color="cyan" underline>Task Settings</Text>
               </Box>
-            );
-          })}
+              {getTaskDefinition(config.selectedTask).taskFields.map((field, index) => {
+                const selected = screen === 'config' && configSection === 'task' && index === taskFieldIndex;
+                const editing = editingField === `task:${String(field.key)}`;
+                return (
+                  <Box key={String(field.key)}>
+                    <Box width={2}>
+                      {selected ? <Text color="green" bold>&gt;</Text> : <Text> </Text>}
+                    </Box>
+                    <Box width={18}>
+                      <Text>{field.label}:</Text>
+                    </Box>
+                    {editing ? (
+                      <TextInput
+                        value={draftValue}
+                        onChange={setDraftValue}
+                        onSubmit={(value) => {
+                          setConfig((current) => writeTaskField(current, config.selectedTask, field, value));
+                          setEditingField(undefined);
+                          setDraftValue('');
+                          setStatus(`Updated task config: ${field.label}`);
+                        }}
+                      />
+                    ) : selected ? (
+                      <Text color="green">{readTaskField(config, config.selectedTask, field)}</Text>
+                    ) : (
+                      <Text>{readTaskField(config, config.selectedTask, field)}</Text>
+                    )}
+                  </Box>
+                );
+              })}
+            </Box>
+          )}
+
+          {screen === 'confirm' && (
+            <Box marginTop={2} borderStyle="single" borderColor="green" paddingX={1} flexDirection="column">
+              <Text color="green" bold>Ready to Run</Text>
+              <Text>Press <Text color="whiteBright" bold>Enter</Text> or <Text color="whiteBright" bold>r</Text> to start.</Text>
+            </Box>
+          )}
         </Box>
       </Box>
 
-      <Box marginTop={1} flexDirection="column">
-        <Text color="yellow">Confirm</Text>
-        {screen === 'confirm' ? (
-          <>
-            <Text>Provider: PyPI</Text>
-            <Text>Task: {getTaskDefinition(config.selectedTask).label}</Text>
-            <Text>Profile: {config.base.profileName}</Text>
-            <Text>Simple URL: {config.base.simpleUrl}</Text>
-            <Text>Metadata Root: {config.base.metadataRoot}</Text>
-            <Text>Mirror Root: {config.base.mirrorRoot}</Text>
-            {getTaskDefinition(config.selectedTask).taskFields.map((field) => (
-              <Text key={field.key}>
-                {field.label}: {readTaskField(config, config.selectedTask, field)}
-              </Text>
-            ))}
-            <Text color="green">Press Enter to start</Text>
-          </>
-        ) : (
-          <Text dimColor>Enter confirmation step from the config screen.</Text>
-        )}
-      </Box>
+      {running && renderProgressBar()}
 
-      <Box marginTop={1} flexDirection="column">
-        <Text color="yellow">Status</Text>
+      <Box marginTop={2} borderStyle="round" borderColor="gray" paddingX={1} flexDirection="column">
+        <Text color="yellow" bold>Status Console</Text>
         <Text>{loading ? 'Loading...' : status}</Text>
-        <Text dimColor>{running ? 'Running task...' : saving ? 'Saving config...' : `Current screen: ${screen}`}</Text>
+        {logs.slice(-3).map((line, index) => <Text dimColor key={`${index}-${line}`}>{line}</Text>)}
       </Box>
 
-      <Box marginTop={1} flexDirection="column">
-        <Text color="yellow">Keys</Text>
-        <Text>Provider: Enter or n next</Text>
-        <Text>Task: Up/Down select, Enter or n next, b back</Text>
-        <Text>Config: h base, l task, Up/Down select, Enter edit, s save, c confirm, b back</Text>
-        <Text>Confirm: Enter or r start, s save, b back, q quit</Text>
-      </Box>
-
-      <Box marginTop={1} flexDirection="column">
-        <Text color="yellow">Recent Events</Text>
-        {logs.length === 0 ? <Text dimColor>No runs yet.</Text> : logs.map((line, index) => <Text key={`${index}-${line}`}>{line}</Text>)}
-      </Box>
-
-      <Box marginTop={1} flexDirection="column">
-        <Text color="yellow">Last Result</Text>
-        {summaryLines.length === 0 ? (
-          <Text dimColor>No completed run yet.</Text>
-        ) : (
-          summaryLines.map((line, index) => <Text key={`${index}-${line}`}>{line}</Text>)
-        )}
+      <Box marginTop={1} flexDirection="row" justifyContent="space-between">
+        <Text dimColor>
+          {running
+            ? 'Keys: [p] Pause/Resume, [c] Cancel, [q] Quit'
+            : screen === 'config'
+            ? 'Keys: [↑/↓] Select, [Enter/e] Edit, [Tab/h/l] Switch Section, [c] Confirm, [s] Save, [b] Back, [q] Quit'
+            : 'Keys: [↑/↓] Select, [Enter/n] Next, [b] Back, [q] Quit'}
+        </Text>
       </Box>
     </Box>
   );

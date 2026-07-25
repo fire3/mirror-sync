@@ -1,3 +1,5 @@
+import type {TaskController} from '../app/task-controller.js';
+
 export type ArtifactSource = 'html' | 'json';
 
 export interface PackageRecord {
@@ -76,6 +78,8 @@ export interface DownloaderOptions {
   retry: number;
   timeoutMs: number;
   userAgent?: string | undefined;
+  taskController?: TaskController | undefined;
+  onProgress?: ((downloaded: number, failed: number, total: number) => void) | undefined;
 }
 
 export interface DownloadSummary {
