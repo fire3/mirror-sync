@@ -1,11 +1,14 @@
+import {readFileSync} from 'node:fs';
 import {readFile} from 'node:fs/promises';
 import {join} from 'node:path';
 
 import {executeDownloadPlan} from '../core/downloader/downloader.js';
 import {buildDownloadPlan} from '../core/planner/download-plan.js';
 import {diffSnapshotManifests} from '../core/planner/snapshot-diff.js';
-import {writeJsonFile} from '../core/storage/jsonl.js';
+import {readJsonLines, writeJsonFile} from '../core/storage/jsonl.js';
+import {pathExists} from './config.js';
 import {fetchAndWritePackageList} from '../providers/pypi/fetch-package-list.js';
+import {buildDownloadPlanFromSnapshot} from '../providers/pypi/build-download-plan-from-snapshot.js';
 import {fetchPackageMetadata} from '../providers/pypi/fetch-package-metadata.js';
 import {buildManifestFromSnapshot} from '../providers/pypi/manifest-builder.js';
 import type {AppConfig, DownloadPlan, PypiTaskType, SnapshotManifest, SyncRunResult} from '../shared/types.js';
@@ -45,9 +48,36 @@ async function readJsonFile<T>(path: string): Promise<T> {
   return JSON.parse(await readFile(path, 'utf8')) as T;
 }
 
-async function loadManifestByDate(metadataRoot: string, metadataDate: string): Promise<SnapshotManifest> {
+async function loadManifestByDate(
+  metadataRoot: string,
+  metadataDate: string,
+  simpleBaseUrl: string
+): Promise<SnapshotManifest> {
   const manifestPath = buildManifestPath(metadataRoot, metadataDate);
-  return readJsonFile<SnapshotManifest>(manifestPath);
+  if (!(await pathExists(manifestPath))) {
+    return buildManifestFromSnapshot({
+      snapshotRoot: buildSnapshotRoot(metadataRoot, metadataDate),
+      simpleBaseUrl,
+      writeOutputs: false
+    });
+  }
+
+  const manifest = await readJsonFile<SnapshotManifest>(manifestPath);
+  if (manifest.packages.length > 0 || manifest.artifacts.length > 0) {
+    return manifest;
+  }
+
+  const snapshotRoot = buildSnapshotRoot(metadataRoot, metadataDate);
+  const [packages, artifacts] = await Promise.all([
+    readJsonLines<SnapshotManifest['packages'][number]>(join(snapshotRoot, 'manifests', 'packages.jsonl')),
+    readJsonLines<SnapshotManifest['artifacts'][number]>(join(snapshotRoot, 'manifests', 'artifacts.jsonl'))
+  ]);
+
+  return {
+    ...manifest,
+    packages,
+    artifacts
+  };
 }
 
 async function writePlan(metadataRoot: string, metadataDate: string, fileName: string, plan: DownloadPlan): Promise<string> {
@@ -68,6 +98,32 @@ async function runMetadataSyncTask(
   emit(onEvent, 'Prepare', `PyPI / ${taskLabel('metadata-sync')}`);
   emit(onEvent, 'Fetch /simple/', `Fetching package list from ${config.base.simpleUrl}`);
   const packageNames = await fetchAndWritePackageList(config.base.simpleUrl, packageListPath, DEFAULT_BROWSER_USER_AGENT);
+  // #region debug-point D:package-list-retained
+  (() => {
+    let u = 'http://127.0.0.1:7777/event';
+    let s = 'metadata-oom';
+    try {
+      const e = readFileSync('.dbg/metadata-oom.env', 'utf8');
+      u = e.match(/DEBUG_SERVER_URL=(.+)/)?.[1] ?? u;
+      s = e.match(/DEBUG_SESSION_ID=(.+)/)?.[1] ?? s;
+    } catch {}
+    fetch(u, {
+      method: 'POST',
+      body: JSON.stringify({
+        sessionId: s,
+        runId: 'pre-fix',
+        hypothesisId: 'D',
+        location: 'run-sync.ts:runMetadataSyncTask:afterPackageList',
+        msg: '[DEBUG] package list retained for metadata stage',
+        data: {
+          packageCount: packageNames.length,
+          heapUsed: process.memoryUsage().heapUsed
+        },
+        ts: Date.now()
+      })
+    }).catch(() => {});
+  })();
+  // #endregion
   emit(onEvent, 'Fetch /simple/', `Fetched ${packageNames.length} packages`);
 
   emit(onEvent, 'Download Metadata', `Writing snapshot into ${snapshotRoot}`);
@@ -91,19 +147,40 @@ async function runMetadataSyncTask(
     'Download Metadata',
     `HTML ${metadataSummary.htmlSuccess}/${metadataSummary.packagesTotal}, JSON ${metadataSummary.jsonSuccess}/${metadataSummary.packagesTotal}`
   );
-
-  emit(onEvent, 'Build Manifest', 'Building normalized snapshot manifest');
-  const manifest = await buildManifestFromSnapshot({
-    snapshotRoot,
-    simpleBaseUrl: config.base.simpleUrl
-  });
+  // #region debug-point A:metadata-stage-summary
+  (() => {
+    let u = 'http://127.0.0.1:7777/event';
+    let s = 'metadata-oom';
+    try {
+      const e = readFileSync('.dbg/metadata-oom.env', 'utf8');
+      u = e.match(/DEBUG_SERVER_URL=(.+)/)?.[1] ?? u;
+      s = e.match(/DEBUG_SESSION_ID=(.+)/)?.[1] ?? s;
+    } catch {}
+    fetch(u, {
+      method: 'POST',
+      body: JSON.stringify({
+        sessionId: s,
+        runId: 'pre-fix',
+        hypothesisId: 'A',
+        location: 'run-sync.ts:runMetadataSyncTask:afterMetadata',
+        msg: '[DEBUG] metadata stage finished',
+        data: {
+          htmlSuccess: metadataSummary.htmlSuccess,
+          jsonSuccess: metadataSummary.jsonSuccess,
+          failureCount: metadataSummary.failures.length,
+          heapUsed: process.memoryUsage().heapUsed
+        },
+        ts: Date.now()
+      })
+    }).catch(() => {});
+  })();
+  // #endregion
 
   await writeJsonFile(join(config.base.metadataRoot, 'current.json'), {
     provider: 'pypi',
     taskType: 'metadata-sync',
     snapshotId,
-    snapshotRoot,
-    manifestPath: buildManifestPath(config.base.metadataRoot, snapshotId)
+    snapshotRoot
   });
 
   emit(onEvent, 'Finalize', `Snapshot ${snapshotId} completed`);
@@ -112,8 +189,7 @@ async function runMetadataSyncTask(
     taskType: 'metadata-sync',
     snapshotId,
     snapshotRoot,
-    packageCount: packageNames.length,
-    manifest
+    packageCount: packageNames.length
   };
 }
 
@@ -124,15 +200,16 @@ async function runArtifactDownloadTask(
 ): Promise<SyncRunResult> {
   const metadataDate = config.pypi.artifactDownload.metadataDate;
   const outputDate = config.pypi.artifactDownload.outputDate;
-  const manifest = await loadManifestByDate(config.base.metadataRoot, metadataDate);
+  const snapshotRoot = buildSnapshotRoot(config.base.metadataRoot, metadataDate);
   const outputRoot = buildMirrorOutputRoot(config.base.mirrorRoot, outputDate);
 
   emit(onEvent, 'Prepare', `PyPI / ${taskLabel('artifact-download')}`);
-  emit(onEvent, 'Load Manifest', `Loading manifest from metadata date ${metadataDate}`);
+  emit(onEvent, 'Load Snapshot', `Loading package metadata from ${snapshotRoot}`);
 
-  const plan = buildDownloadPlan({
-    mirrorRoot: outputRoot,
-    newManifest: manifest
+  const plan = await buildDownloadPlanFromSnapshot({
+    snapshotRoot,
+    simpleBaseUrl: config.base.simpleUrl,
+    mirrorRoot: outputRoot
   });
   const planPath = await writePlan(config.base.metadataRoot, metadataDate, `download-plan-${outputDate}.json`, plan);
   emit(onEvent, 'Build Plan', `Planned ${plan.entries.length} downloads -> ${outputRoot}`);
@@ -171,7 +248,6 @@ async function runArtifactDownloadTask(
     provider: 'pypi',
     taskType: 'artifact-download',
     snapshotId: metadataDate,
-    manifest,
     plan,
     downloadSummary,
     outputRoot
@@ -187,8 +263,8 @@ async function runIncrementalDownloadTask(
   const newMetadataDate = config.pypi.incrementalDownload.newMetadataDate;
   const outputDate = config.pypi.incrementalDownload.outputDate;
   const [oldManifest, newManifest] = await Promise.all([
-    loadManifestByDate(config.base.metadataRoot, oldMetadataDate),
-    loadManifestByDate(config.base.metadataRoot, newMetadataDate)
+    loadManifestByDate(config.base.metadataRoot, oldMetadataDate, config.base.simpleUrl),
+    loadManifestByDate(config.base.metadataRoot, newMetadataDate, config.base.simpleUrl)
   ]);
   const outputRoot = buildMirrorOutputRoot(config.base.mirrorRoot, outputDate);
 

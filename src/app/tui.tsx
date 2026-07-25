@@ -1,4 +1,5 @@
 import React, {useEffect, useMemo, useState} from 'react';
+import {readFileSync} from 'node:fs';
 import {Box, Text, render, useApp, useInput, useStdin, useStdout} from 'ink';
 import TextInput from 'ink-text-input';
 
@@ -232,6 +233,42 @@ function InteractiveApp(): React.JSX.Element {
         onEvent: (event: SyncEvent) => {
           setStatus(`${event.stage}: ${event.message}`);
           if (event.progress) {
+            if (
+              event.progress.current === 0 ||
+              event.progress.current === event.progress.total ||
+              event.progress.current % 10000 === 0
+            ) {
+              // #region debug-point B:tui-progress-state
+              (() => {
+                let u = 'http://127.0.0.1:7777/event';
+                let s = 'metadata-oom';
+                try {
+                  const e = readFileSync('.dbg/metadata-oom.env', 'utf8');
+                  u = e.match(/DEBUG_SERVER_URL=(.+)/)?.[1] ?? u;
+                  s = e.match(/DEBUG_SESSION_ID=(.+)/)?.[1] ?? s;
+                } catch {}
+                fetch(u, {
+                  method: 'POST',
+                  body: JSON.stringify({
+                    sessionId: s,
+                    runId: 'pre-fix',
+                    hypothesisId: 'B',
+                    location: 'tui.tsx:runCurrentTask:onEvent',
+                    msg: '[DEBUG] tui progress state',
+                    data: {
+                      stage: event.stage,
+                      current: event.progress.current,
+                      total: event.progress.total,
+                      activeCount: event.progress.active.length,
+                      logCount: logs.length,
+                      heapUsed: process.memoryUsage().heapUsed
+                    },
+                    ts: Date.now()
+                  })
+                }).catch(() => {});
+              })();
+              // #endregion
+            }
             setProgressData(event.progress);
           } else {
             setLogs((current) => appendLog(current, `[${event.stage}] ${event.message}`));

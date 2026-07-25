@@ -1,3 +1,4 @@
+import {readFileSync} from 'node:fs';
 import {mkdir, writeFile} from 'node:fs/promises';
 import {dirname} from 'node:path';
 
@@ -14,7 +15,36 @@ export async function fetchPackageList(simpleUrl: string, userAgent?: string): P
     throw new Error(`Failed to fetch package list from ${simpleUrl}: ${response.status}`);
   }
 
-  return extractPackageNames(await response.text());
+  const html = await response.text();
+  const packages = extractPackageNames(html);
+  // #region debug-point A:package-list-size
+  (() => {
+    let u = 'http://127.0.0.1:7777/event';
+    let s = 'metadata-oom';
+    try {
+      const e = readFileSync('.dbg/metadata-oom.env', 'utf8');
+      u = e.match(/DEBUG_SERVER_URL=(.+)/)?.[1] ?? u;
+      s = e.match(/DEBUG_SESSION_ID=(.+)/)?.[1] ?? s;
+    } catch {}
+    fetch(u, {
+      method: 'POST',
+      body: JSON.stringify({
+        sessionId: s,
+        runId: 'pre-fix',
+        hypothesisId: 'A',
+        location: 'fetch-package-list.ts:fetchPackageList',
+        msg: '[DEBUG] package list extracted',
+        data: {
+          htmlLength: html.length,
+          packageCount: packages.length,
+          heapUsed: process.memoryUsage().heapUsed
+        },
+        ts: Date.now()
+      })
+    }).catch(() => {});
+  })();
+  // #endregion
+  return packages;
 }
 
 export async function fetchAndWritePackageList(

@@ -1,7 +1,8 @@
-import {readdir, readFile} from 'node:fs/promises';
+import {readFileSync} from 'node:fs';
+import {readdir, readFile, writeFile} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
 
-import {writeJsonFile, writeJsonLines} from '../../core/storage/jsonl.js';
+import {appendJsonLine, writeJsonFile} from '../../core/storage/jsonl.js';
 import type {ArtifactRecord, PackageRecord, SnapshotManifest, SnapshotStats} from '../../shared/types.js';
 import {resolveArtifactPath} from './path-resolution.js';
 import {parseSimpleIndexHtml} from './simple-index.js';
@@ -49,17 +50,29 @@ export async function buildManifestFromSnapshot(
 ): Promise<SnapshotManifest> {
   const snapshotId = snapshotIdFromPath(options.snapshotRoot);
   const simpleRoot = join(options.snapshotRoot, 'simple');
+  const shouldWriteOutputs = options.writeOutputs ?? true;
+  const packagesPath = join(options.snapshotRoot, 'manifests', 'packages.jsonl');
+  const artifactsPath = join(options.snapshotRoot, 'manifests', 'artifacts.jsonl');
   const packageEntries = await readdir(simpleRoot, {withFileTypes: true});
   const packageDirs = packageEntries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
 
   const packages: PackageRecord[] = [];
-  const artifacts = new Map<string, ArtifactRecord>();
+  const artifacts = shouldWriteOutputs ? undefined : new Map<string, ArtifactRecord>();
+  let packagesWithHtml = 0;
+  let packagesWithJson = 0;
+  let artifactsTotal = 0;
 
-  for (const packageName of packageDirs) {
+  if (shouldWriteOutputs) {
+    await writeFile(packagesPath, '', 'utf8');
+    await writeFile(artifactsPath, '', 'utf8');
+  }
+
+  for (const [index, packageName] of packageDirs.entries()) {
     const packageRoot = join(simpleRoot, packageName);
     const htmlPath = join(packageRoot, 'index.html');
     const jsonPath = join(packageRoot, 'index_v1.json');
     const simplePageUrl = buildPackageUrl(options.simpleBaseUrl, packageName);
+    const packageArtifacts = new Map<string, ArtifactRecord>();
 
     let htmlContent: string | undefined;
     let jsonContent: string | undefined;
@@ -81,7 +94,7 @@ export async function buildManifestFromSnapshot(
       for (const file of payload.files ?? []) {
         const resolvedPath = resolveArtifactPath(packageName, simplePageUrl, file.url);
         const hash = firstHash(file.hashes);
-        artifacts.set(resolvedPath.relativePath, {
+        const artifactRecord: ArtifactRecord = {
           package: packageName,
           filename: file.filename,
           relativePath: resolvedPath.relativePath,
@@ -92,19 +105,21 @@ export async function buildManifestFromSnapshot(
           ...(file.uploadTime ? {uploadTime: file.uploadTime} : {}),
           source: 'json',
           snapshotId
-        });
+        };
+        packageArtifacts.set(resolvedPath.relativePath, artifactRecord);
+        artifacts?.set(resolvedPath.relativePath, artifactRecord);
       }
     }
 
     if (htmlContent) {
       for (const entry of parseSimpleIndexHtml(htmlContent)) {
         const resolvedPath = resolveArtifactPath(packageName, simplePageUrl, entry.href);
-        if (artifacts.has(resolvedPath.relativePath)) {
+        if (packageArtifacts.has(resolvedPath.relativePath)) {
           continue;
         }
 
         const hashFragment = entry.href.split('#', 2)[1];
-        artifacts.set(resolvedPath.relativePath, {
+        const artifactRecord: ArtifactRecord = {
           package: packageName,
           filename: entry.filename,
           relativePath: resolvedPath.relativePath,
@@ -114,28 +129,80 @@ export async function buildManifestFromSnapshot(
           ...(entry.yanked ? {yanked: entry.yanked} : {}),
           source: 'html',
           snapshotId
-        });
+        };
+        packageArtifacts.set(resolvedPath.relativePath, artifactRecord);
+        artifacts?.set(resolvedPath.relativePath, artifactRecord);
       }
     }
 
-    packages.push({
+    const packageRecord: PackageRecord = {
       name: packageName,
       snapshotId,
       htmlPresent: Boolean(htmlContent),
       jsonPresent: Boolean(jsonContent),
-      artifactCount: Array.from(artifacts.values()).filter((artifact) => artifact.package === packageName).length
-    });
+      artifactCount: packageArtifacts.size
+    };
+
+    if (htmlContent) {
+      packagesWithHtml += 1;
+    }
+    if (jsonContent) {
+      packagesWithJson += 1;
+    }
+    artifactsTotal += packageArtifacts.size;
+
+    if (shouldWriteOutputs) {
+      await appendJsonLine(packagesPath, packageRecord);
+      for (const artifact of packageArtifacts.values()) {
+        await appendJsonLine(artifactsPath, artifact);
+      }
+    } else {
+      packages.push(packageRecord);
+    }
+
+    if (index === 0 || (index + 1) % 1000 === 0 || index + 1 === packageDirs.length) {
+      // #region debug-point E:manifest-build-progress
+      (() => {
+        let u = 'http://127.0.0.1:7777/event';
+        let s = 'metadata-oom';
+        try {
+          const e = readFileSync('.dbg/metadata-oom.env', 'utf8');
+          u = e.match(/DEBUG_SERVER_URL=(.+)/)?.[1] ?? u;
+          s = e.match(/DEBUG_SESSION_ID=(.+)/)?.[1] ?? s;
+        } catch {}
+        fetch(u, {
+          method: 'POST',
+          body: JSON.stringify({
+            sessionId: s,
+            runId: 'pre-fix',
+            hypothesisId: 'A',
+            location: 'manifest-builder.ts:buildManifestFromSnapshot',
+            msg: '[DEBUG] manifest build progress',
+            data: {
+              processedPackages: index + 1,
+              totalPackages: packageDirs.length,
+              artifactCount: shouldWriteOutputs ? artifactsTotal : (artifacts?.size ?? 0),
+              heapUsed: process.memoryUsage().heapUsed
+            },
+            ts: Date.now()
+          })
+        }).catch(() => {});
+      })();
+      // #endregion
+    }
   }
 
-  const sortedArtifacts = Array.from(artifacts.values()).sort((left, right) =>
-    left.relativePath.localeCompare(right.relativePath)
-  );
+  const sortedArtifacts = shouldWriteOutputs
+    ? []
+    : Array.from((artifacts ?? new Map<string, ArtifactRecord>()).values()).sort((left, right) =>
+        left.relativePath.localeCompare(right.relativePath)
+      );
 
   const stats: SnapshotStats = {
-    packagesTotal: packages.length,
-    packagesWithHtml: packages.filter((item) => item.htmlPresent).length,
-    packagesWithJson: packages.filter((item) => item.jsonPresent).length,
-    artifactsTotal: sortedArtifacts.length
+    packagesTotal: packageDirs.length,
+    packagesWithHtml,
+    packagesWithJson,
+    artifactsTotal
   };
 
   const manifest: SnapshotManifest = {
@@ -145,9 +212,7 @@ export async function buildManifestFromSnapshot(
     stats
   };
 
-  if (options.writeOutputs ?? true) {
-    await writeJsonLines(join(options.snapshotRoot, 'manifests', 'packages.jsonl'), packages);
-    await writeJsonLines(join(options.snapshotRoot, 'manifests', 'artifacts.jsonl'), sortedArtifacts);
+  if (shouldWriteOutputs) {
     await writeJsonFile(join(options.snapshotRoot, 'stats.json'), stats);
     await writeJsonFile(join(options.snapshotRoot, 'manifest.json'), manifest);
   }

@@ -2,8 +2,6 @@ import {createHash} from 'node:crypto';
 import {mkdir, readFile, rename, stat, unlink, writeFile} from 'node:fs/promises';
 import {dirname} from 'node:path';
 
-import pLimit from 'p-limit';
-
 import type {DownloadPlan, DownloadPlanEntry, DownloaderOptions, DownloadSummary} from '../../shared/types.js';
 
 const DEFAULT_USER_AGENT =
@@ -86,7 +84,6 @@ export async function executeDownloadPlan(
   plan: DownloadPlan,
   options: DownloaderOptions
 ): Promise<DownloadSummary> {
-  const limit = pLimit(options.concurrency);
   const failed: Array<{entry: DownloadPlanEntry; error: string}> = [];
   let downloaded = 0;
   const total = plan.entries.length;
@@ -96,44 +93,50 @@ export async function executeDownloadPlan(
     options.onProgress?.(downloaded, failed.length, total, Array.from(activeDownloads));
   };
 
-  await Promise.all(
-    plan.entries.map((entry) =>
-      limit(async () => {
-        if (options.taskController) {
-          await options.taskController.check();
-        }
+  let index = 0;
+  const workers = Array.from({ length: options.concurrency }, async () => {
+    while (index < total) {
+      if (options.taskController) {
+        await options.taskController.check();
+      }
 
-        const downloadKey = `${entry.package}/${entry.filename}`;
-        activeDownloads.add(downloadKey);
-        updateProgress();
+      const entry = plan.entries[index];
+      index += 1;
+      
+      if (!entry) continue;
 
-        try {
-          const destinationStats = await stat(entry.destinationPath).catch(() => undefined);
-          if (destinationStats && destinationStats.size > 0) {
-            downloaded += 1;
-            activeDownloads.delete(downloadKey);
-            updateProgress();
-            return;
-          }
+      const downloadKey = `${entry.package}/${entry.filename}`;
+      activeDownloads.add(downloadKey);
+      updateProgress();
 
-          await fetchWithRetry(entry, options);
+      try {
+        const destinationStats = await stat(entry.destinationPath).catch(() => undefined);
+        if (destinationStats && destinationStats.size > 0) {
           downloaded += 1;
           activeDownloads.delete(downloadKey);
           updateProgress();
-        } catch (error) {
-          failed.push({
-            entry,
-            error: error instanceof Error ? error.message : String(error)
-          });
-          activeDownloads.delete(downloadKey);
-          updateProgress();
+          continue;
         }
-      })
-    )
-  );
+
+        await fetchWithRetry(entry, options);
+        downloaded += 1;
+        activeDownloads.delete(downloadKey);
+        updateProgress();
+      } catch (error) {
+        failed.push({
+          entry,
+          error: error instanceof Error ? error.message : String(error)
+        });
+        activeDownloads.delete(downloadKey);
+        updateProgress();
+      }
+    }
+  });
+
+  await Promise.all(workers);
 
   return {
-    attempted: plan.entries.length,
+    attempted: total,
     downloaded,
     skipped: plan.skippedCheckpoint.length + plan.skippedExisting.length + plan.skippedNotFound.length,
     failed
