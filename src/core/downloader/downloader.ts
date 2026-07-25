@@ -90,9 +90,10 @@ export async function executeDownloadPlan(
   const failed: Array<{entry: DownloadPlanEntry; error: string}> = [];
   let downloaded = 0;
   const total = plan.entries.length;
+  const activeDownloads = new Set<string>();
 
   const updateProgress = () => {
-    options.onProgress?.(downloaded, failed.length, total);
+    options.onProgress?.(downloaded, failed.length, total, Array.from(activeDownloads));
   };
 
   await Promise.all(
@@ -102,22 +103,29 @@ export async function executeDownloadPlan(
           await options.taskController.check();
         }
 
+        const downloadKey = `${entry.package}/${entry.filename}`;
+        activeDownloads.add(downloadKey);
+        updateProgress();
+
         try {
           const destinationStats = await stat(entry.destinationPath).catch(() => undefined);
           if (destinationStats && destinationStats.size > 0) {
             downloaded += 1;
+            activeDownloads.delete(downloadKey);
             updateProgress();
             return;
           }
 
           await fetchWithRetry(entry, options);
           downloaded += 1;
+          activeDownloads.delete(downloadKey);
           updateProgress();
         } catch (error) {
           failed.push({
             entry,
             error: error instanceof Error ? error.message : String(error)
           });
+          activeDownloads.delete(downloadKey);
           updateProgress();
         }
       })

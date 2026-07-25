@@ -79,7 +79,7 @@ export interface DownloaderOptions {
   timeoutMs: number;
   userAgent?: string | undefined;
   taskController?: TaskController | undefined;
-  onProgress?: ((downloaded: number, failed: number, total: number) => void) | undefined;
+  onProgress?: ((downloaded: number, failed: number, total: number, active: string[]) => void) | undefined;
 }
 
 export interface DownloadSummary {

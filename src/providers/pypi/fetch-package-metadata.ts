@@ -2,6 +2,7 @@ import {mkdir, writeFile} from 'node:fs/promises';
 import {dirname, join} from 'node:path';
 
 import pLimit from 'p-limit';
+import type {TaskController} from '../../app/task-controller.js';
 
 export interface FetchPackageMetadataOptions {
   simpleUrl: string;
@@ -9,6 +10,8 @@ export interface FetchPackageMetadataOptions {
   packageNames: string[];
   concurrency: number;
   userAgent?: string | undefined;
+  taskController?: TaskController | undefined;
+  onProgress?: ((current: number, total: number, active: string[]) => void) | undefined;
 }
 
 export interface FetchPackageMetadataSummary {
@@ -56,10 +59,24 @@ export async function fetchPackageMetadata(
   const failures: FetchPackageMetadataSummary['failures'] = [];
   let htmlSuccess = 0;
   let jsonSuccess = 0;
+  let processed = 0;
+  const total = options.packageNames.length;
+  const activeDownloads = new Set<string>();
+
+  const updateProgress = () => {
+    options.onProgress?.(processed, total, Array.from(activeDownloads));
+  };
 
   await Promise.all(
     options.packageNames.map((packageName) =>
       limit(async () => {
+        if (options.taskController) {
+          await options.taskController.check();
+        }
+
+        activeDownloads.add(packageName);
+        updateProgress();
+
         const url = packageUrl(options.simpleUrl, packageName);
         const packageRoot = join(options.snapshotRoot, 'simple', packageName);
         const htmlPath = join(packageRoot, 'index.html');
@@ -95,6 +112,10 @@ export async function fetchPackageMetadata(
             error: error instanceof Error ? error.message : String(error)
           });
         }
+
+        processed += 1;
+        activeDownloads.delete(packageName);
+        updateProgress();
       })
     )
   );

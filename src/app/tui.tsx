@@ -1,5 +1,5 @@
 import React, {useEffect, useMemo, useState} from 'react';
-import {Box, Text, render, useApp, useInput, useStdin} from 'ink';
+import {Box, Text, render, useApp, useInput, useStdin, useStdout} from 'ink';
 import TextInput from 'ink-text-input';
 
 import {DEFAULT_CONFIG_PATH, defaultConfig, loadConfig, normalizeConfig, saveConfig, taskLabel} from './config.js';
@@ -152,12 +152,23 @@ function InteractiveApp(): React.JSX.Element {
   const [logs, setLogs] = useState<string[]>([]);
   const [lastResult, setLastResult] = useState<SyncRunResult | undefined>();
   const [taskController, setTaskController] = useState<TaskController | undefined>();
-  const [progressData, setProgressData] = useState<{current: number; total: number; failed: number} | undefined>();
+  const [progressData, setProgressData] = useState<{current: number; total: number; failed: number; active?: string[]} | undefined>();
 
   const selectedTask = TASK_DEFINITIONS[taskIndex] ?? TASK_DEFINITIONS[0]!;
   const baseField = BASE_FIELDS[baseFieldIndex];
   const taskField = selectedTask.taskFields[taskFieldIndex];
   const isEditing = Boolean(editingField);
+
+  const { stdout } = useStdout();
+  const [size, setSize] = useState({ columns: stdout.columns, rows: stdout.rows });
+
+  useEffect(() => {
+    const onResize = () => setSize({ columns: stdout.columns, rows: stdout.rows });
+    stdout.on('resize', onResize);
+    return () => {
+      stdout.off('resize', onResize);
+    };
+  }, [stdout]);
 
   useEffect(() => {
     void (async () => {
@@ -436,7 +447,7 @@ function InteractiveApp(): React.JSX.Element {
     if (!progressData || progressData.total === 0) {
       return null;
     }
-    const {current, total, failed} = progressData;
+    const {current, total, failed, active} = progressData;
     const percent = Math.min(100, Math.max(0, Math.floor((current / total) * 100)));
     const barWidth = 40;
     const filled = Math.floor((percent / 100) * barWidth);
@@ -444,7 +455,7 @@ function InteractiveApp(): React.JSX.Element {
     const bar = '█'.repeat(filled) + '░'.repeat(empty);
     return (
       <Box flexDirection="column" marginTop={1}>
-        <Text color="yellow">Download Progress</Text>
+        <Text color="yellow">Task Progress</Text>
         <Box>
           <Text color={taskController?.isPaused() ? "yellow" : "cyan"}>{bar}</Text>
           <Text> {percent}% </Text>
@@ -452,18 +463,42 @@ function InteractiveApp(): React.JSX.Element {
           {failed > 0 && <Text color="red"> Failed: {failed}</Text>}
         </Box>
         {taskController?.isPaused() && <Text color="yellow">Task is PAUSED</Text>}
+        {active && active.length > 0 && (
+          <Box flexDirection="column" marginTop={1}>
+            <Text dimColor>Active items ({active.length}):</Text>
+            {active.slice(0, 4).map(item => <Text key={item} color="cyan">  ⠋ {item}</Text>)}
+            {active.length > 4 && <Text dimColor>  ... and {active.length - 4} more</Text>}
+          </Box>
+        )}
       </Box>
     );
   };
 
+  const getStepColor = (step: number) => {
+    if (running) return step === 4 ? "green" : "gray";
+    if (screen === 'provider') return step === 1 ? "green" : "gray";
+    if (screen === 'task') return step === 2 ? "green" : "gray";
+    if (screen === 'config') return step === 3 ? "green" : "gray";
+    if (screen === 'confirm') return step === 4 ? "green" : "gray";
+    return "gray";
+  };
+
   return (
-    <Box flexDirection="column" padding={1} width={80}>
-      <Box borderStyle="round" borderColor="cyan" paddingX={2} paddingY={1} flexDirection="column">
+    <Box flexDirection="column" padding={1} width={size.columns} height={size.rows}>
+      <Box borderStyle="round" borderColor="cyan" paddingX={2} paddingY={0} flexDirection="column">
         <Text color="cyan" bold>mirror-sync TUI</Text>
-        <Text dimColor>Step 1: Provider ➔ Step 2: Task ➔ Step 3: Config ➔ Step 4: Run</Text>
+        <Box flexDirection="row">
+          <Text color={getStepColor(1)} bold={getStepColor(1) === 'green'}>Step 1: Provider </Text>
+          <Text color="gray">➔ </Text>
+          <Text color={getStepColor(2)} bold={getStepColor(2) === 'green'}>Step 2: Task </Text>
+          <Text color="gray">➔ </Text>
+          <Text color={getStepColor(3)} bold={getStepColor(3) === 'green'}>Step 3: Config </Text>
+          <Text color="gray">➔ </Text>
+          <Text color={getStepColor(4)} bold={getStepColor(4) === 'green'}>Step 4: Run</Text>
+        </Box>
       </Box>
 
-      <Box marginTop={1} flexDirection="row">
+      <Box flexGrow={1} flexDirection="row" marginTop={1}>
         {/* Left Column: Provider & Task */}
         <Box flexDirection="column" width="40%" paddingRight={2}>
           <Text color="yellow" bold>Provider</Text>
@@ -596,7 +631,7 @@ function InteractiveApp(): React.JSX.Element {
 
       {running && renderProgressBar()}
 
-      <Box marginTop={2} borderStyle="round" borderColor="gray" paddingX={1} flexDirection="column">
+      <Box marginTop={2} borderStyle="round" borderColor="gray" paddingX={1} flexDirection="column" height={6}>
         <Text color="yellow" bold>Status Console</Text>
         <Text>{loading ? 'Loading...' : status}</Text>
         {logs.slice(-3).map((line, index) => <Text dimColor key={`${index}-${line}`}>{line}</Text>)}
@@ -631,5 +666,10 @@ function App(): React.JSX.Element {
 
   return <InteractiveApp />;
 }
+
+process.stdout.write('\x1b[?1049h');
+process.on('exit', () => {
+  process.stdout.write('\x1b[?1049l');
+});
 
 render(<App />);

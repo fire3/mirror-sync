@@ -27,6 +27,7 @@ export interface SyncEvent {
     current: number;
     total: number;
     failed: number;
+    active: string[];
   };
 }
 
@@ -57,7 +58,8 @@ async function writePlan(metadataRoot: string, metadataDate: string, fileName: s
 
 async function runMetadataSyncTask(
   config: AppConfig,
-  onEvent: RunSyncOptions['onEvent']
+  onEvent: RunSyncOptions['onEvent'],
+  taskController?: TaskController
 ): Promise<SyncRunResult> {
   const snapshotId = config.pypi.metadataSync.snapshotDate;
   const snapshotRoot = buildSnapshotRoot(config.base.metadataRoot, snapshotId);
@@ -74,7 +76,15 @@ async function runMetadataSyncTask(
     packageNames,
     snapshotRoot,
     concurrency: config.base.concurrency,
-    userAgent: DEFAULT_BROWSER_USER_AGENT
+    userAgent: DEFAULT_BROWSER_USER_AGENT,
+    taskController,
+    onProgress: (current, total, active) => {
+      onEvent?.({
+        stage: 'Download Metadata',
+        message: `Downloading package metadata ${current}/${total}`,
+        progress: { current, total, failed: 0, active }
+      });
+    }
   });
   emit(
     onEvent,
@@ -133,11 +143,11 @@ async function runArtifactDownloadTask(
     timeoutMs: config.base.timeoutMs,
     userAgent: DEFAULT_BROWSER_USER_AGENT,
     taskController,
-    onProgress: (current, failed, total) => {
+    onProgress: (current, failed, total, active) => {
       onEvent?.({
         stage: 'Download',
         message: `Downloading ${current}/${total} (Failed: ${failed})`,
-        progress: { current, total, failed }
+        progress: { current, total, failed, active }
       });
     }
   });
@@ -204,11 +214,11 @@ async function runIncrementalDownloadTask(
     timeoutMs: config.base.timeoutMs,
     userAgent: DEFAULT_BROWSER_USER_AGENT,
     taskController,
-    onProgress: (current, failed, total) => {
+    onProgress: (current, failed, total, active) => {
       onEvent?.({
         stage: 'Download',
         message: `Downloading ${current}/${total} (Failed: ${failed})`,
-        progress: { current, total, failed }
+        progress: { current, total, failed, active }
       });
     }
   });
@@ -249,7 +259,7 @@ async function runPypiTask(
 ): Promise<SyncRunResult> {
   switch (taskType) {
     case 'metadata-sync':
-      return runMetadataSyncTask(config, onEvent);
+      return runMetadataSyncTask(config, onEvent, taskController);
     case 'artifact-download':
       return runArtifactDownloadTask(config, onEvent, taskController);
     case 'incremental-download':
