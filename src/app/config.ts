@@ -48,8 +48,17 @@ function normalizeUrl(url: string): string {
   return url.endsWith('/') ? url : `${url}/`;
 }
 
-function fallbackDate(value: string): string {
-  return value.trim() || buildSnapshotId();
+function fallbackDate(value: string | undefined): string {
+  if (!value) return buildSnapshotId();
+  const trimmed = value.trim();
+  if (!trimmed) return buildSnapshotId();
+  
+  // If it's an old ISO format (contains T), just take the date part
+  if (trimmed.includes('T')) {
+    return trimmed.split('T')[0]!;
+  }
+  
+  return trimmed;
 }
 
 export function normalizeConfig(config: AppConfig): AppConfig {
@@ -73,16 +82,16 @@ export function normalizeConfig(config: AppConfig): AppConfig {
     selectedTask: config.selectedTask,
     pypi: {
       metadataSync: {
-        snapshotDate: fallbackDate(config.pypi.metadataSync.snapshotDate || defaults.pypi.metadataSync.snapshotDate)
+        snapshotDate: fallbackDate(config.pypi.metadataSync.snapshotDate)
       },
       artifactDownload: {
         metadataDate: config.pypi.artifactDownload.metadataDate.trim(),
-        outputDate: fallbackDate(config.pypi.artifactDownload.outputDate || defaults.pypi.artifactDownload.outputDate)
+        outputDate: fallbackDate(config.pypi.artifactDownload.outputDate)
       },
       incrementalDownload: {
         oldMetadataDate: config.pypi.incrementalDownload.oldMetadataDate.trim(),
         newMetadataDate: config.pypi.incrementalDownload.newMetadataDate.trim(),
-        outputDate: fallbackDate(config.pypi.incrementalDownload.outputDate || defaults.pypi.incrementalDownload.outputDate)
+        outputDate: fallbackDate(config.pypi.incrementalDownload.outputDate)
       }
     }
   };
