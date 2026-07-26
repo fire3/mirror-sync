@@ -53,7 +53,7 @@ var taskDefs = []taskDef{
 		id:          types.PypiTaskMetadataSync,
 		label:       "下载元数据",
 		description: "同步 PyPI simple 元数据 (HTML + JSON) 到本地。",
-		fields:      []fieldDef{{key: "snapshotDate", label: "Snapshot Date"}},
+		fields:      nil, // no config needed — date is always today
 	},
 	{
 		id:          types.PypiTaskArtifactDownload,
@@ -221,17 +221,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case configLoadedMsg:
 		m.loading = false
 		m.cfg = msg.cfg
-		// Always use today for date fields that are stale (not today)
-		today := config.BuildSnapshotID(time.Now())
-		if m.cfg.PyPI.MetadataSync.SnapshotDate != today {
-			m.cfg.PyPI.MetadataSync.SnapshotDate = today
-		}
-		if m.cfg.PyPI.ArtifactDownload.OutputDate != today {
-			m.cfg.PyPI.ArtifactDownload.OutputDate = today
-		}
-		if m.cfg.PyPI.IncrementalDownload.OutputDate != today {
-			m.cfg.PyPI.IncrementalDownload.OutputDate = today
-		}
+		// Always reset dates to today
+		m.resetDates()
 		for i, td := range taskDefs {
 			if td.id == m.cfg.SelectedTask {
 				m.taskIdx = i
@@ -289,6 +280,22 @@ func (m *model) addLog(s string) {
 	if len(m.logs) > 50 {
 		m.logs = m.logs[len(m.logs)-50:]
 	}
+}
+
+func (m *model) resetDates() {
+	today := config.BuildSnapshotID(time.Now())
+	m.cfg.PyPI.MetadataSync.SnapshotDate = today
+	if m.cfg.PyPI.ArtifactDownload.MetadataDate == "" {
+		m.cfg.PyPI.ArtifactDownload.MetadataDate = today
+	}
+	m.cfg.PyPI.ArtifactDownload.OutputDate = today
+	if m.cfg.PyPI.IncrementalDownload.OldMetadataDate == "" {
+		m.cfg.PyPI.IncrementalDownload.OldMetadataDate = today
+	}
+	if m.cfg.PyPI.IncrementalDownload.NewMetadataDate == "" {
+		m.cfg.PyPI.IncrementalDownload.NewMetadataDate = today
+	}
+	m.cfg.PyPI.IncrementalDownload.OutputDate = today
 }
 
 // ── Key dispatch ───────────────────────────────────────────────────────────
@@ -405,7 +412,12 @@ func (m model) handleTask(key string, keyType tea.KeyType) (tea.Model, tea.Cmd) 
 		m.taskIdx = (m.taskIdx + 1) % len(taskDefs)
 	case keyType == tea.KeyEnter || key == "enter":
 		m.cfg.SelectedTask = taskDefs[m.taskIdx].id
-		m.configSection = configBase
+		// Default to Task Settings section if the task has fields
+		if len(taskDefs[m.taskIdx].fields) > 0 {
+			m.configSection = configTask
+		} else {
+			m.configSection = configBase
+		}
 		m.baseFieldIdx = 0
 		m.taskFieldIdx = 0
 		m.screen = screenConfig
@@ -526,6 +538,10 @@ func (m model) handleConfirm(key string, keyType tea.KeyType) (tea.Model, tea.Cm
 		m.status = "Starting..."
 		ctrl := taskctrl.New()
 		m.taskController = ctrl
+		// Force metadata-sync snapshot to today
+		if m.cfg.SelectedTask == types.PypiTaskMetadataSync {
+			m.cfg.PyPI.MetadataSync.SnapshotDate = config.BuildSnapshotID(time.Now())
+		}
 		m.addLog("[run] " + string(m.cfg.SelectedTask))
 		cfg := config.NormalizeConfig(m.cfg)
 		m.cfg = cfg
@@ -748,18 +764,20 @@ func (m model) viewConfig(w int) string {
 
 	lines = append(lines, "")
 
-	// Task section
-	secLabel2 := "  Task Settings"
-	if m.configSection == configTask {
-		secLabel2 = sHighlight.Render("▸ Task Settings")
-	}
-	lines = append(lines, sCyan.Render(secLabel2))
+	// Task section — only show when there are task-specific fields
+	if len(taskDefs[m.taskIdx].fields) > 0 {
+		secLabel2 := "  Task Settings"
+		if m.configSection == configTask {
+			secLabel2 = sHighlight.Render("▸ Task Settings")
+		}
+		lines = append(lines, sCyan.Render(secLabel2))
 
-	for i, f := range taskDefs[m.taskIdx].fields {
-		sel := m.configSection == configTask && i == m.taskFieldIdx && m.editingField == ""
-		edit := m.editingField == "task:"+f.key
-		val := getTaskFieldValue(m.cfg, m.cfg.SelectedTask, f.key)
-		lines = append(lines, m.renderField(f.label, val, sel, edit))
+		for i, f := range taskDefs[m.taskIdx].fields {
+			sel := m.configSection == configTask && i == m.taskFieldIdx && m.editingField == ""
+			edit := m.editingField == "task:"+f.key
+			val := getTaskFieldValue(m.cfg, m.cfg.SelectedTask, f.key)
+			lines = append(lines, m.renderField(f.label, val, sel, edit))
+		}
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
@@ -802,7 +820,8 @@ func (m model) viewConfirm(w int) string {
 	// Task-specific params
 	switch cfg.SelectedTask {
 	case types.PypiTaskMetadataSync:
-		items = append(items, fmt.Sprintf("Snapshot:    %s", cfg.PyPI.MetadataSync.SnapshotDate))
+		// Always use today — no config needed
+		items = append(items, fmt.Sprintf("Snapshot:    %s", config.BuildSnapshotID(time.Now())))
 	case types.PypiTaskArtifactDownload:
 		items = append(items,
 			fmt.Sprintf("Source Date: %s", cfg.PyPI.ArtifactDownload.MetadataDate),

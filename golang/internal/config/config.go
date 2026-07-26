@@ -134,12 +134,12 @@ func NormalizeConfig(cfg types.AppConfig) types.AppConfig {
 				SnapshotDate: fallbackDate(cfg.PyPI.MetadataSync.SnapshotDate),
 			},
 			ArtifactDownload: types.ArtifactDownloadTaskConfig{
-				MetadataDate: strings.TrimSpace(cfg.PyPI.ArtifactDownload.MetadataDate),
+				MetadataDate: fallbackDate(cfg.PyPI.ArtifactDownload.MetadataDate),
 				OutputDate:   fallbackDate(cfg.PyPI.ArtifactDownload.OutputDate),
 			},
 			IncrementalDownload: types.IncrementalDownloadTaskConfig{
-				OldMetadataDate: strings.TrimSpace(cfg.PyPI.IncrementalDownload.OldMetadataDate),
-				NewMetadataDate: strings.TrimSpace(cfg.PyPI.IncrementalDownload.NewMetadataDate),
+				OldMetadataDate: fallbackDate(cfg.PyPI.IncrementalDownload.OldMetadataDate),
+				NewMetadataDate: fallbackDate(cfg.PyPI.IncrementalDownload.NewMetadataDate),
 				OutputDate:      fallbackDate(cfg.PyPI.IncrementalDownload.OutputDate),
 			},
 		},

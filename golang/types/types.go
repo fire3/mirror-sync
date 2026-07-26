@@ -153,20 +153,21 @@ type BaseAppConfig struct {
 
 // MetadataSyncTaskConfig configures a metadata sync task.
 type MetadataSyncTaskConfig struct {
-	SnapshotDate string `json:"snapshotDate"`
+	// SnapshotDate is only used in-memory; the config file always omits it.
+	SnapshotDate string `json:"-"`
 }
 
 // ArtifactDownloadTaskConfig configures an artifact download task.
 type ArtifactDownloadTaskConfig struct {
-	MetadataDate string `json:"metadataDate"`
-	OutputDate   string `json:"outputDate"`
+	MetadataDate string `json:"-"`
+	OutputDate   string `json:"-"`
 }
 
 // IncrementalDownloadTaskConfig configures an incremental download task.
 type IncrementalDownloadTaskConfig struct {
-	OldMetadataDate string `json:"oldMetadataDate"`
-	NewMetadataDate string `json:"newMetadataDate"`
-	OutputDate      string `json:"outputDate"`
+	OldMetadataDate string `json:"-"`
+	NewMetadataDate string `json:"-"`
+	OutputDate      string `json:"-"`
 }
 
 // PypiTaskConfigs holds all PyPI task configs.
