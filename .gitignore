@@ -1,6 +1,22 @@
+# Tools
 .tools/
+
+# Go
+golang/mirror-sync
+golang/mirror-sync.exe
+golang/.gocache/
+
+# Build outputs
 dist/
-node_modules/
 coverage/
+
+# Logs & temp
 *.log
 *.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
