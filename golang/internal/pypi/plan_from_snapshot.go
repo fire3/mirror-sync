@@ -141,6 +141,88 @@ func BuildDownloadPlanFromSnapshot(opts BuildDownloadPlanFromSnapshotOptions) (t
 	}, nil
 }
 
+// ForEachPackageOptions configures per-package iteration over a snapshot.
+type ForEachPackageOptions struct {
+	SnapshotRoot  string
+	SimpleBaseURL string
+	MirrorRoot    string
+	Filter        *types.PypiFilterOptions
+}
+
+// ForEachPackageInSnapshot iterates over each package in the snapshot,
+// resolves its artifacts, applies filters, and calls fn for each package.
+// If fn returns an error, iteration stops and the error is returned.
+// This is memory-friendly: only one package's artifacts are in memory at a time.
+func ForEachPackageInSnapshot(opts ForEachPackageOptions, fn func(group types.PackageArtifactGroup) error) error {
+	filter := opts.Filter
+	if filter == nil {
+		f := DefaultFilterOptions
+		filter = &f
+	}
+
+	simpleRoot := filepath.Join(opts.SnapshotRoot, "simple")
+	dirEntries, err := os.ReadDir(simpleRoot)
+	if err != nil {
+		return fmt.Errorf("read simple root: %w", err)
+	}
+
+	var pkgDirs []string
+	for _, entry := range dirEntries {
+		if entry.IsDir() {
+			pkgDirs = append(pkgDirs, entry.Name())
+		}
+	}
+	sort.Strings(pkgDirs)
+
+	for _, pkgName := range pkgDirs {
+		pkgRoot := filepath.Join(simpleRoot, pkgName)
+		htmlPath := filepath.Join(pkgRoot, "index.html")
+		simplePageURL := buildPackageURL(opts.SimpleBaseURL, pkgName)
+		var artifacts []types.ArtifactRecord
+
+		// Read HTML metadata (the authoritative source for download links)
+		if htmlData, err := os.ReadFile(htmlPath); err == nil {
+			for _, item := range ParseSimpleIndexHTML(string(htmlData)) {
+				resolved := ResolveArtifactPath(pkgName, simplePageURL, item.Href)
+				if !ShouldIncludeArtifact(pkgName, item.Filename, *filter) {
+					continue
+				}
+
+				hash := ""
+				if idx := strings.IndexByte(item.Href, '#'); idx >= 0 {
+					hashStr := item.Href[idx+1:]
+					hash = strings.ReplaceAll(hashStr, "=", ":")
+				}
+
+				record := types.ArtifactRecord{
+					Package:      pkgName,
+					Filename:     item.Filename,
+					RelativePath: resolved.RelativePath,
+					URL:          resolved.RemoteURL,
+					Source:       types.ArtifactSourceHTML,
+				}
+				if hash != "" {
+					record.Hash = &hash
+				}
+				artifacts = append(artifacts, record)
+			}
+		}
+
+		if len(artifacts) == 0 {
+			continue
+		}
+
+		if err := fn(types.PackageArtifactGroup{
+			Package:   pkgName,
+			Artifacts: artifacts,
+		}); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func addEntry(entry *types.DownloadPlanEntry, filter types.PypiFilterOptions,
 	completedPaths, notFoundPaths map[string]struct{},
 	skippedExisting, skippedCheckpoint, skippedNotFound *[]string,

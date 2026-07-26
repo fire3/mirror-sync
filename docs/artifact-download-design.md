@@ -145,30 +145,78 @@ ExcludePackages     = []     # 空 = 不排除
 │                              ↓                              │
 │               metadataDate = "2026-07-25"                    │
 │                              ↓                              │
-│  Stage 1: Build / Load Manifest                             │
+│  Stage 1: Ensure Manifest (≈零延迟)                          │
 │    ├── 检查 manifests/artifacts.jsonl 是否存在               │
-│    ├── 存在 → 直接加载（避免重新遍历 50 万目录）             │
-│    └── 不存在 → BuildManifestFromSnapshot → 写入 manifests/  │
+│    ├── 存在 → 直接使用（O(1)）                              │
+│    │  读取 stats.json 获取预估总包数 → 展示 "~350,000 包"   │
+│    └── 不存在 → BuildManifestFromSnapshot → 流式写入 JSONL  │
 │                              ↓                              │
-│  Stage 2: Build Plan (按包)                                  │
-│    ├── 加载 artifacts.jsonl                                  │
-│    ├── 应用过滤器 → 只保留常用平台                           │
-│    ├── 加载 checkpoint.jsonl → 跳过已完成的包                │
-│    ├── 对未完成的包，检查每个文件的 DestinationPath 是否存在 │
-│    └── 输出 download-plan.json（包列表 + 待下载文件）        │
+│  Stage 2: Pipeline — 流式读取 + 并发下载 (流水线)            │
+│    ┌─────────────────────────────────────────────────────┐  │
+│    │ Producer (1 goroutine)                              │  │
+│    │ 逐行读取 artifacts.jsonl → 按包分组 → 发到 channel  │  │
+│    └──────────────┬──────────────────────────────────────┘  │
+│                   │ pkgCh (缓冲 50 个包)                     │
+│    ┌──────────────┼──────────────────────────────────────┐  │
+│    │       ┌──────┴──────┐                               │  │
+│    │  ┌────┤ Consumer x4 ├────┐                          │  │
+│    │  │    └─────────────┘    │                          │  │
+│    │  │                       │                          │  │
+│    │  │ 每个 Consumer:         │                          │  │
+│    │  │ 1. 取一个包           │                          │  │
+│    │  │ 2. 跳过 checkpoint 完成│                          │  │
+│    │  │ 3. 构建下载条目       │                          │  │
+│    │  │ 4. 并发下载包内文件   │                          │  │
+│    │  │ 5. 成功→checkpoint    │                          │  │
+│    │  │    失败→stateStore    │                          │  │
+│    │  └───────────────────────┘                          │  │
+│    └─────────────────────────────────────────────────────┘  │
 │                              ↓                              │
-│  Stage 3: Download (按包串行，包内文件并发)                  │
-│    ├── 逐包处理：                                            │
-│    │   ├── 包的多个 artifact 并发下载（16 workers 共享）     │
-│    │   ├── 每个文件：下载 → 校验 hash → rename               │
-│    │   ├── 包内全部成功后 → 追加一条 checkpoint              │
-│    │   └── 包内有失败 → 记录 failed，该包不标记完成          │
-│    ├── 实时进度（按包计数：完成包数 / 总包数）               │
+│  Stage 3: Summary                                           │
 │    └── 生成 run-summary.json                                 │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 3.1 关键差异：按包处理 vs 按文件处理
+### 3.1 流水线优势（消除预扫描延迟）
+
+**旧方案的问题**（重写前）：
+```
+1. 遍历 JSONL 计数待处理包 → 耗时 30-60 秒（50 万行）
+2. 再遍历 JSONL 逐包处理     → 耗时与下载并行
+总计：下载开始前必须等待步骤 1 完成
+```
+
+**新方案的流水线**：
+```
+Producer goroutine 启动 → 立即开始读取 JSONL，读到第一个包就发送到 channel
+Consumer goroutine 启动 → 立即取包并发下载
+```
+
+| 指标 | 旧方案 | 新方案 |
+|------|--------|--------|
+| 下载开始前等待 | 30-60 秒（完整遍历） | < 1 秒（读第一行） |
+| JSONL 遍历次数 | 2 次（计数 + 处理） | 1 次（流式读取） |
+| 包间并发 | 串行 | 4 个包同时处理 |
+| 进度总量来源 | 遍历计数 | stats.json 估算 |
+
+**stats.json 估算**：`BuildManifestFromSnapshot` 生成 manifest 时会同时写入 `stats.json`，其中包含 `packagesTotal`（总包数）。这个值作为进度总量参考，使得进度条在下载开始时就有分母，无需额外遍历。
+
+如果 `stats.json` 不存在（旧快照），进度展示为 `?`，仅显示已处理绝对数。
+
+### 3.2 两级并发模型
+
+```
+包间并发 (pipelineDepth=4)
+  ├── 包 A ─── 包内文件并发 (16 workers)
+  ├── 包 B ─── 包内文件并发 (16 workers)  
+  ├── 包 C ─── 包内文件并发 (16 workers)
+  └── 包 D ─── 包内文件并发 (16 workers)
+```
+
+- **包间并发**：最多 4 个包同时处理，由 `pipelineDepth` 常量控制
+- **包内并发**：每个包的文件使用 `cfg.Base.Concurrency` 个 worker
+- **总 HTTP 并发峰值**：`pipelineDepth × cfg.Base.Concurrency`（默认 4×16=64）
+- **背压机制**：channel 缓冲满（50 个包）时 producer 自动阻塞，等待 consumer 消费
 
 传统按文件处理：
 ```

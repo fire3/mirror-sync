@@ -74,6 +74,13 @@ type PypiFilterOptions struct {
 	ExcludePackages     []string `json:"excludePackages,omitempty"`
 }
 
+// PackageArtifactGroup groups artifact records by package name.
+// Used for per-package checkpoint and download processing.
+type PackageArtifactGroup struct {
+	Package   string           `json:"package"`
+	Artifacts []ArtifactRecord `json:"artifacts"`
+}
+
 // DownloadPlanEntry is a single entry in a download plan.
 type DownloadPlanEntry struct {
 	Package         string `json:"package"`

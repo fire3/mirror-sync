@@ -5,6 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/user/mirror-sync/internal/config"
 	"github.com/user/mirror-sync/internal/core/downloader"
@@ -23,10 +27,11 @@ type SyncEvent struct {
 
 // SyncProgress contains progress information.
 type SyncProgress struct {
-	Current int
-	Total   int
-	Failed  int
-	Active  []string
+	Current   int
+	Total     int
+	Failed    int
+	Active    []string
+	Completed string // name of the most recently completed package (empty if none)
 }
 
 // RunSyncOptions configures a sync run.
@@ -151,53 +156,276 @@ func runMetadataSync(cfg types.AppConfig, onEvent func(SyncEvent), tc types.Canc
 	}, nil
 }
 
+// loadPackageListCount reads package-list.txt from the snapshot root and
+// returns the number of lines (≈ total packages) for progress estimation.
+// Returns 0 if the file doesn't exist or can't be read.
+func loadPackageListCount(snapshotRoot string) int {
+	path := filepath.Join(snapshotRoot, "package-list.txt")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" {
+		return 0
+	}
+	return len(strings.Split(trimmed, "\n"))
+}
+
 func runArtifactDownload(cfg types.AppConfig, onEvent func(SyncEvent), tc types.Canceller) (types.SyncRunResult, error) {
 	metadataDate := cfg.PyPI.ArtifactDownload.MetadataDate
 	outputDate := cfg.PyPI.ArtifactDownload.OutputDate
 	snapshotRoot := config.BuildSnapshotRoot(cfg.Base.MetadataRoot, metadataDate)
 	outputRoot := config.BuildMirrorOutputRoot(cfg.Base.MirrorRoot, outputDate)
+	stateDir := filepath.Join(outputRoot, "state")
 
 	emit(onEvent, "Prepare", fmt.Sprintf("PyPI / %s", config.TaskLabel(types.PypiTaskArtifactDownload)), nil)
-	emit(onEvent, "Load Snapshot", fmt.Sprintf("Loading package metadata from %s", snapshotRoot), nil)
+	emit(onEvent, "Scan Metadata", fmt.Sprintf("Scanning %s/simple/ ...", snapshotRoot), nil)
 
-	plan, err := pypi.BuildDownloadPlanFromSnapshot(pypi.BuildDownloadPlanFromSnapshotOptions{
-		SnapshotRoot:  snapshotRoot,
-		SimpleBaseURL: cfg.Base.SimpleURL,
-		MirrorRoot:    outputRoot,
-	})
+	// ── Stage 1: Initialize checkpoint & state store ────────────────
+	checkpointPath := filepath.Join(stateDir, "checkpoint.jsonl")
+	checkpointStore, err := downloader.LoadCheckpoint(checkpointPath)
 	if err != nil {
-		return types.SyncRunResult{}, fmt.Errorf("build plan: %w", err)
+		return types.SyncRunResult{}, fmt.Errorf("load checkpoint: %w", err)
+	}
+	defer checkpointStore.Close()
+
+	stateStore, err := downloader.NewStateStore(stateDir)
+	if err != nil {
+		return types.SyncRunResult{}, fmt.Errorf("init state store: %w", err)
+	}
+	defer stateStore.Close()
+
+	// Get total package estimation from package-list.txt
+	totalEstimate := loadPackageListCount(snapshotRoot)
+	estimatedStr := fmt.Sprintf("%d", totalEstimate)
+	if totalEstimate == 0 {
+		estimatedStr = "?"
+	}
+	emit(onEvent, "Scan Metadata", fmt.Sprintf("Estimated packages: %s (pipeline started)", estimatedStr),
+		&SyncProgress{Current: 0, Total: totalEstimate, Failed: 0})
+
+	// ── Stage 2: Pipeline — scan simple/ & download concurrently ────
+	// Producer: traverses simple/ directory, parses HTML, sends packages to channel
+	// Consumers: receive packages and download their files concurrently.
+	//
+	// Two-level concurrency:
+	//   - Inter-package: up to 4 packages processed simultaneously
+	//   - Intra-package: each package's files use cfg.Base.Concurrency workers
+
+	const pipelineDepth = 4          // max concurrent packages in pipeline
+	pkgCh := make(chan types.PackageArtifactGroup, 50)
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+
+	// Producer goroutine: traverse simple/ directory directly (no manifest dependency)
+	go func() {
+		defer close(pkgCh)
+		filter := pypi.DefaultFilterOptions
+		err := pypi.ForEachPackageInSnapshot(pypi.ForEachPackageOptions{
+			SnapshotRoot:  snapshotRoot,
+			SimpleBaseURL: cfg.Base.SimpleURL,
+			MirrorRoot:    outputRoot,
+			Filter:        &filter,
+		}, func(group types.PackageArtifactGroup) error {
+			if tc != nil {
+				if err := tc.Check(); err != nil {
+					return err
+				}
+			}
+			select {
+			case pkgCh <- group:
+				return nil
+			case <-done:
+				return fmt.Errorf("cancelled")
+			}
+		})
+		if err != nil {
+			errCh <- err
+		}
+	}()
+
+	// Progress tracking (thread-safe via atomic)
+	var completed atomic.Int64
+	var failed atomic.Int64
+	var skipped atomic.Int64
+
+	// Active packages for TUI display
+	var activeMu sync.Mutex
+	activePkgs := make(map[string]struct{})
+
+	// Shared failed list (append-only, guarded by mutex)
+	var failedMu sync.Mutex
+	var allFailed []types.DownloadFailedEntry
+
+	// Consumer worker pool
+	var wg sync.WaitGroup
+	for range pipelineDepth {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for group := range pkgCh {
+				// Check cancellation
+				if tc != nil {
+					if err := tc.Check(); err != nil {
+						return
+					}
+				}
+
+				// Track active package
+				activeMu.Lock()
+				activePkgs[group.Package] = struct{}{}
+				// Build active list
+				activeList := make([]string, 0, len(activePkgs))
+				for p := range activePkgs {
+					if len(activeList) < 4 {
+						activeList = append(activeList, p)
+					}
+				}
+				activeMu.Unlock()
+
+				if checkpointStore.IsCompleted(group.Package) {
+					activeMu.Lock()
+					delete(activePkgs, group.Package)
+					activeMu.Unlock()
+					completed.Add(1)
+					skipped.Add(1)
+					emit(onEvent, "Download",
+						fmt.Sprintf("Processing %s (skipped, already done)", group.Package),
+						&SyncProgress{
+							Current:   int(completed.Load()),
+							Total:     totalEstimate,
+							Failed:    int(failed.Load()),
+							Completed: group.Package,
+						})
+					continue
+				}
+
+				// Build per-package download entries
+				var pkgEntries []types.DownloadPlanEntry
+				for _, artifact := range group.Artifacts {
+					destPath := filepath.Join(outputRoot, artifact.RelativePath)
+					entry := types.DownloadPlanEntry{
+						Package:         artifact.Package,
+						Filename:        artifact.Filename,
+						RelativePath:    artifact.RelativePath,
+						DestinationPath: destPath,
+						URL:             artifact.URL,
+						Reason:          "full-sync",
+					}
+					if artifact.Hash != nil {
+						entry.Hash = artifact.Hash
+					}
+					if fi, err := os.Stat(destPath); err == nil && fi.Size() > 0 {
+						continue
+					}
+					pkgEntries = append(pkgEntries, entry)
+				}
+
+				if len(pkgEntries) == 0 {
+					// All files already exist
+					_ = checkpointStore.CompletePackage(downloader.PackageCheckpoint{
+						Package: group.Package, CompletedAt: time.Now().UTC(),
+						Files: len(group.Artifacts), Bytes: 0,
+					})
+					activeMu.Lock()
+					delete(activePkgs, group.Package)
+					activeMu.Unlock()
+					completed.Add(1)
+					skipped.Add(1)
+					emit(onEvent, "Download",
+						fmt.Sprintf("%s: all files exist (skipped)", group.Package),
+						&SyncProgress{
+							Current:   int(completed.Load()),
+							Total:     totalEstimate,
+							Failed:    int(failed.Load()),
+							Active:    activeList,
+							Completed: group.Package,
+						})
+					continue
+				}
+
+				// Execute download for this package's files
+				pkgPlan := types.DownloadPlan{Entries: pkgEntries}
+				summary := downloader.ExecuteDownloadPlan(pkgPlan, types.DownloaderOptions{
+					Concurrency:    cfg.Base.Concurrency,
+					Retry:          cfg.Base.Retry,
+					TimeoutMs:      cfg.Base.TimeoutMs,
+					UserAgent:      config.DefaultBrowserUserAgent,
+					TaskController: tc,
+					OnProgress: func(current, failedFiles, total int, active []string) {
+						emit(onEvent, "Download",
+							fmt.Sprintf("%s: %d/%d files", group.Package, current, total),
+							&SyncProgress{
+								Current: int(completed.Load()),
+								Total:   totalEstimate,
+								Failed:  int(failed.Load()),
+								Active:  active,
+							})
+					},
+				})
+
+				activeMu.Lock()
+				delete(activePkgs, group.Package)
+				activeMu.Unlock()
+
+				if len(summary.Failed) > 0 {
+					failedMu.Lock()
+					for _, f := range summary.Failed {
+						_ = stateStore.RecordFailed(f.Entry.Package, f.Entry.Filename, f.Entry.RelativePath, f.Error)
+					}
+					allFailed = append(allFailed, summary.Failed...)
+					failedMu.Unlock()
+					failed.Add(1)
+				} else {
+					_ = checkpointStore.CompletePackage(downloader.PackageCheckpoint{
+						Package: group.Package, CompletedAt: time.Now().UTC(),
+						Files: len(group.Artifacts), Bytes: 0,
+					})
+				}
+				completed.Add(1)
+				emit(onEvent, "Download",
+					fmt.Sprintf("%s: done (%d files)", group.Package, len(group.Artifacts)),
+					&SyncProgress{
+						Current:   int(completed.Load()),
+						Total:     totalEstimate,
+						Failed:    int(failed.Load()),
+						Completed: group.Package,
+					})
+			}
+		}()
 	}
 
-	planPath, err := writePlan(cfg.Base.MetadataRoot, metadataDate, fmt.Sprintf("download-plan-%s.json", outputDate), plan)
-	if err != nil {
-		return types.SyncRunResult{}, fmt.Errorf("write plan: %w", err)
-	}
-	emit(onEvent, "Build Plan", fmt.Sprintf("Planned %d downloads -> %s", len(plan.Entries), outputRoot), nil)
+	// Wait for producer and consumers to finish
+	wg.Wait()
+	close(done)
 
-	downloadSummary := downloader.ExecuteDownloadPlan(plan, types.DownloaderOptions{
-		Concurrency:    cfg.Base.Concurrency,
-		Retry:          cfg.Base.Retry,
-		TimeoutMs:      cfg.Base.TimeoutMs,
-		UserAgent:      config.DefaultBrowserUserAgent,
-		TaskController: tc,
-		OnProgress: func(current, failed, total int, active []string) {
-			emit(onEvent, "Download", fmt.Sprintf("Downloading %d/%d (Failed: %d)", current, total, failed),
-				&SyncProgress{Current: current, Total: total, Failed: failed, Active: active})
-		},
-	})
+	// Check for producer error
+	select {
+	case err = <-errCh:
+		if err != nil {
+			return types.SyncRunResult{}, fmt.Errorf("package iteration: %w", err)
+		}
+	default:
+	}
+
+	completedVal := int(completed.Load())
+	failedVal := int(failed.Load())
+	skippedVal := int(skipped.Load())
+
 	emit(onEvent, "Download",
-		fmt.Sprintf("Downloaded %d/%d, failed %d", downloadSummary.Downloaded, downloadSummary.Attempted, len(downloadSummary.Failed)),
-		nil)
+		fmt.Sprintf("Packages: %d completed, %d failed", completedVal-failedVal, failedVal), nil)
 
-	// Write run-summary.json
+	// ── Stage 4: Write summary ────────────────────────────────────────
 	summaryData := map[string]interface{}{
-		"provider":     "pypi",
-		"taskType":     "artifact-download",
-		"metadataDate": metadataDate,
-		"outputDate":   outputDate,
-		"outputRoot":   outputRoot,
-		"planPath":     planPath,
+		"provider":          "pypi",
+		"taskType":          "artifact-download",
+		"metadataDate":      metadataDate,
+		"outputDate":        outputDate,
+		"outputRoot":        outputRoot,
+		"packagesTotal":     completedVal,
+		"packagesCompleted": completedVal - failedVal,
+		"packagesFailed":    failedVal,
 	}
 	if err := storage.WriteJSONFile(filepath.Join(outputRoot, "run-summary.json"), summaryData); err != nil {
 		return types.SyncRunResult{}, fmt.Errorf("write run-summary: %w", err)
@@ -206,12 +434,16 @@ func runArtifactDownload(cfg types.AppConfig, onEvent func(SyncEvent), tc types.
 	emit(onEvent, "Finalize", fmt.Sprintf("Artifact download completed into %s", outputRoot), nil)
 
 	return types.SyncRunResult{
-		Provider:        types.ProviderTypePyPI,
-		TaskType:        types.PypiTaskArtifactDownload,
-		SnapshotID:      &metadataDate,
-		Plan:            &plan,
-		DownloadSummary: &downloadSummary,
-		OutputRoot:      &outputRoot,
+		Provider:   types.ProviderTypePyPI,
+		TaskType:   types.PypiTaskArtifactDownload,
+		SnapshotID: &metadataDate,
+		OutputRoot: &outputRoot,
+		DownloadSummary: &types.DownloadSummary{
+			Attempted:  completedVal,
+			Downloaded: completedVal - failedVal - skippedVal,
+			Skipped:    skippedVal,
+			Failed:     allFailed,
+		},
 	}, nil
 }
 

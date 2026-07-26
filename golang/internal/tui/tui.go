@@ -1,7 +1,11 @@
 package tui
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,6 +26,7 @@ type Screen int
 const (
 	screenProvider Screen = iota
 	screenTask
+	screenSnapshot
 	screenConfig
 	screenConfirm
 	screenRunning
@@ -60,7 +65,6 @@ var taskDefs = []taskDef{
 		label:       "按单日快照下载包",
 		description: "根据指定日期的元数据快照，下载全部包文件。",
 		fields: []fieldDef{
-			{key: "metadataDate", label: "Source Date"},
 			{key: "outputDate", label: "Output Date"},
 		},
 	},
@@ -74,6 +78,31 @@ var taskDefs = []taskDef{
 			{key: "outputDate", label: "Output Date"},
 		},
 	},
+}
+
+// snapshotEntry represents a discovered metadata snapshot.
+type snapshotEntry struct {
+	name         string
+	packageCount int
+	artifactCount int
+	hasManifest  bool
+}
+
+func (s snapshotEntry) statsLine() string {
+	parts := []string{}
+	if s.packageCount > 0 {
+		parts = append(parts, fmt.Sprintf("%d 包", s.packageCount))
+	}
+	if s.artifactCount > 0 {
+		parts = append(parts, fmt.Sprintf("%d 文件", s.artifactCount))
+	}
+	if s.hasManifest {
+		parts = append(parts, "有manifest")
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "(" + strings.Join(parts, ", ") + ")"
 }
 
 var baseFields = []fieldDef{
@@ -142,6 +171,10 @@ type model struct {
 	lastResult     *types.SyncRunResult
 	taskController *taskctrl.Controller
 	progress       *runner.SyncProgress
+	recentCompleted []string // last N completed package names (ring buffer)
+
+	snapshots   []snapshotEntry
+	snapshotIdx int
 
 	width  int
 	height int
@@ -250,6 +283,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = ev.Stage + ": " + ev.Message
 		if ev.Progress != nil {
 			m.progress = ev.Progress
+			// Track recently completed packages
+			if pkg := ev.Progress.Completed; pkg != "" {
+				m.recentCompleted = append(m.recentCompleted, pkg)
+				if len(m.recentCompleted) > 5 {
+					m.recentCompleted = m.recentCompleted[len(m.recentCompleted)-5:]
+				}
+			}
 		} else {
 			m.addLog("[" + ev.Stage + "] " + ev.Message)
 		}
@@ -381,6 +421,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleProvider(key, keyType)
 	case screenTask:
 		return m.handleTask(key, keyType)
+	case screenSnapshot:
+		return m.handleSnapshot(key, keyType)
 	case screenConfig:
 		return m.handleConfig(key, keyType)
 	case screenConfirm:
@@ -412,19 +454,64 @@ func (m model) handleTask(key string, keyType tea.KeyType) (tea.Model, tea.Cmd) 
 		m.taskIdx = (m.taskIdx + 1) % len(taskDefs)
 	case keyType == tea.KeyEnter || key == "enter":
 		m.cfg.SelectedTask = taskDefs[m.taskIdx].id
-		// Default to Task Settings section if the task has fields
-		if len(taskDefs[m.taskIdx].fields) > 0 {
-			m.configSection = configTask
+		// Artifact-download: go to snapshot selection first
+		if m.cfg.SelectedTask == types.PypiTaskArtifactDownload {
+			m.snapshots = scanSnapshots(m.cfg.Base.MetadataRoot)
+			m.snapshotIdx = 0
+			m.screen = screenSnapshot
+			m.status = "选择元数据快照"
 		} else {
-			m.configSection = configBase
+			m.screen = screenConfig
+			if len(taskDefs[m.taskIdx].fields) > 0 {
+				m.configSection = configTask
+			} else {
+				m.configSection = configBase
+			}
+			m.baseFieldIdx = 0
+			m.taskFieldIdx = 0
+			m.status = "Task: " + taskDefs[m.taskIdx].label
 		}
-		m.baseFieldIdx = 0
-		m.taskFieldIdx = 0
-		m.screen = screenConfig
-		m.status = "Task: " + taskDefs[m.taskIdx].label
 	case key == "b" || key == "esc" || keyType == tea.KeyEscape:
 		m.screen = screenProvider
 		m.status = "Back to provider"
+	}
+	return m, nil
+}
+
+// ── Screen: Snapshot ────────────────────────────────────────────
+
+func (m model) handleSnapshot(key string, keyType tea.KeyType) (tea.Model, tea.Cmd) {
+	switch {
+	case key == "up" || key == "k":
+		if len(m.snapshots) > 0 {
+			m.snapshotIdx = (m.snapshotIdx - 1 + len(m.snapshots)) % len(m.snapshots)
+		}
+	case key == "down" || key == "j":
+		if len(m.snapshots) > 0 {
+			m.snapshotIdx = (m.snapshotIdx + 1) % len(m.snapshots)
+		}
+	case keyType == tea.KeyEnter || key == "enter":
+		if len(m.snapshots) == 0 {
+			// No snapshots — go back to task
+			m.screen = screenTask
+			m.status = "没有可用快照，请先运行元数据同步"
+			return m, nil
+		}
+		// Set metadata date from selected snapshot (strip "pypi-" prefix)
+		sel := m.snapshots[m.snapshotIdx]
+		dateStr := sel.name
+		if len(dateStr) > 5 && dateStr[:5] == "pypi-" {
+			dateStr = dateStr[5:]
+		}
+		m.cfg.PyPI.ArtifactDownload.MetadataDate = dateStr
+		m.screen = screenConfig
+		m.configSection = configTask
+		m.baseFieldIdx = 0
+		m.taskFieldIdx = 0
+		m.status = "Snapshot: " + sel.name
+	case key == "b" || key == "esc" || keyType == tea.KeyEscape:
+		m.screen = screenTask
+		m.status = "Back to task selection"
 	}
 	return m, nil
 }
@@ -435,8 +522,15 @@ func (m model) handleConfig(key string, keyType tea.KeyType) (tea.Model, tea.Cmd
 	switch {
 	// Navigation
 	case key == "b" || key == "esc" || keyType == tea.KeyEscape:
-		m.screen = screenTask
-		m.status = "Back to task selection"
+		if m.cfg.SelectedTask == types.PypiTaskArtifactDownload {
+			m.screen = screenSnapshot
+			m.snapshots = scanSnapshots(m.cfg.Base.MetadataRoot)
+			m.snapshotIdx = 0
+			m.status = "Back to snapshot selection"
+		} else {
+			m.screen = screenTask
+			m.status = "Back to task selection"
+		}
 		return m, nil
 
 	case key == "tab":
@@ -585,15 +679,28 @@ func runTaskCmd(cfg types.AppConfig, ctrl *taskctrl.Controller) tea.Cmd {
 }
 
 // pumpProgress reads one progress event and returns a Cmd to read the next.
-// When progCh is exhausted, it collects the final result from doneCh.
+// To reduce UI flicker, it drains any subsequent events already buffered
+// in the channel and only sends the latest one for rendering.
 func pumpProgress(progCh <-chan runner.SyncEvent, doneCh <-chan runDoneMsg) tea.Cmd {
 	return func() tea.Msg {
+		// Read first event (blocking wait)
 		ev, ok := <-progCh
-		if ok {
-			return progressMsg{event: ev, progCh: progCh, doneCh: doneCh}
+		if !ok {
+			// progCh closed — task finished, read result
+			return <-doneCh
 		}
-		// progCh closed – task finished, read result
-		return <-doneCh
+		// Non-blocking drain: discard intermediate events, keep only the latest
+		for {
+			select {
+			case latest, ok := <-progCh:
+				if !ok {
+					return progressMsg{event: ev, progCh: progCh, doneCh: doneCh}
+				}
+				ev = latest
+			default:
+				return progressMsg{event: ev, progCh: progCh, doneCh: doneCh}
+			}
+		}
 	}
 }
 
@@ -603,6 +710,7 @@ func (m model) handleDone(key string, keyType tea.KeyType) (tea.Model, tea.Cmd) 
 	m.screen = screenProvider
 	m.lastResult = nil
 	m.progress = nil
+	m.recentCompleted = nil
 	return m, nil
 }
 
@@ -626,8 +734,9 @@ func (m model) View() string {
 	}{
 		{"① Provider", m.screen == screenProvider},
 		{"② Task", m.screen == screenTask},
-		{"③ Config", m.screen == screenConfig},
-		{"④ Run", m.screen == screenConfirm || m.screen == screenRunning || m.screen == screenDone},
+		{"③ Snapshot", m.screen == screenSnapshot},
+		{"④ Config", m.screen == screenConfig},
+		{"⑤ Run", m.screen == screenConfirm || m.screen == screenRunning || m.screen == screenDone},
 	}
 	var stepParts []string
 	for _, s := range steps {
@@ -652,6 +761,8 @@ func (m model) View() string {
 		body = m.viewProvider(contentW)
 	case screenTask:
 		body = m.viewTask(contentW)
+	case screenSnapshot:
+		body = m.viewSnapshot(contentW)
 	case screenConfig:
 		body = m.viewConfig(contentW)
 	case screenConfirm:
@@ -698,6 +809,8 @@ func (m model) helpText() string {
 		return "[Enter] Next  [q] Quit"
 	case screenTask:
 		return "[↑/↓] Select  [Enter] Next  [b] Back  [q] Quit"
+	case screenSnapshot:
+		return "[↑/↓] Select  [Enter] Confirm  [b] Back  [q] Quit"
 	case screenConfig:
 		return "[↑/↓/Tab] Navigate  [Enter/e] Edit  [c] Confirm  [s] Save  [b] Back  [q] Quit"
 	case screenConfirm:
@@ -739,6 +852,50 @@ func (m model) viewTask(w int) string {
 			"",
 		)
 	}
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+// ── View: Snapshot ────────────────────────────────────────────
+
+func (m model) viewSnapshot(w int) string {
+	var lines []string
+	lines = append(lines, sSection.Render("Select Metadata Snapshot"), "")
+	lines = append(lines, sDim.Render(fmt.Sprintf("  metadata root: %s/snapshots/", m.cfg.Base.MetadataRoot)), "")
+
+	if len(m.snapshots) == 0 {
+		lines = append(lines, "", sYellow.Render("  没有找到元数据快照。"))
+		lines = append(lines, sDim.Render("  请先运行「下载元数据」任务。"))
+		lines = append(lines, "", sDim.Render("  按 Enter 返回任务选择。"))
+		return lipgloss.JoinVertical(lipgloss.Left, lines...)
+	}
+
+	// Find the longest name for alignment
+	maxNameLen := 0
+	for _, s := range m.snapshots {
+		if len(s.name) > maxNameLen {
+			maxNameLen = len(s.name)
+		}
+	}
+	namePad := maxNameLen + 2
+	if namePad < 20 {
+		namePad = 20
+	}
+
+	for i, s := range m.snapshots {
+		prefix := "  "
+		nameStyle := sDim
+		if i == m.snapshotIdx {
+			prefix = sHighlight.Render("▸ ")
+			nameStyle = sGreen
+		}
+
+		info := fmt.Sprintf("%s%s%s", prefix, nameStyle.Render(fmt.Sprintf("%-*s", namePad, s.name)), sDim.Render(s.statsLine()))
+		lines = append(lines, info)
+	}
+
+	lines = append(lines, "",
+		sDim.Render("  选择后基于该快照构建下载计划并下载包文件。"))
+
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
@@ -826,6 +983,7 @@ func (m model) viewConfirm(w int) string {
 		items = append(items,
 			fmt.Sprintf("Source Date: %s", cfg.PyPI.ArtifactDownload.MetadataDate),
 			fmt.Sprintf("Output Date: %s", cfg.PyPI.ArtifactDownload.OutputDate),
+			fmt.Sprintf("Snapshot:   pypi-%s", cfg.PyPI.ArtifactDownload.MetadataDate),
 		)
 	case types.PypiTaskIncrementalDownload:
 		items = append(items,
@@ -853,13 +1011,15 @@ func (m model) viewRunning(w int) string {
 	var lines []string
 	lines = append(lines, sSection.Render("Running"), "")
 
-	// Pause banner
+	// Pause banner — fixed 1 line, always present (empty if not paused)
 	if m.taskController != nil && m.taskController.IsPaused() {
-		lines = append(lines, sYellow.Render("  ⏸  PAUSED — press [p] to resume"), "")
+		lines = append(lines, sYellow.Render("  ⏸  PAUSED — press [p] to resume"))
+	} else {
+		lines = append(lines, "")
 	}
 
-	// Progress bar
-	if m.progress != nil && m.progress.Total > 0 {
+	// Progress bar — fixed 3 lines (bar + count + failed/empty)
+	if m.progress != nil {
 		pct := 0
 		if m.progress.Total > 0 {
 			pct = m.progress.Current * 100 / m.progress.Total
@@ -885,37 +1045,55 @@ func (m model) viewRunning(w int) string {
 
 		if m.progress.Failed > 0 {
 			lines = append(lines, sRed.Render(fmt.Sprintf("  ✗ Failed: %d", m.progress.Failed)))
+		} else {
+			lines = append(lines, "")
 		}
 	} else {
-		lines = append(lines, sDim.Render("  Initializing..."))
+		lines = append(lines, "", sDim.Render("  Initializing..."), "")
 	}
 
-	// Active items
+	// Active items — fixed 6 lines (header + up to 4 items + more-line or blank)
+	lines = append(lines, "")
 	if m.progress != nil && len(m.progress.Active) > 0 {
-		lines = append(lines, "")
 		active := m.progress.Active
 		show := len(active)
-		if show > 0 {
-			lines = append(lines, sDim.Render(fmt.Sprintf("  Active (%d)", show)))
-			limit := 3
-			if limit > show {
-				limit = show
-			}
-			// Show items, truncating long filenames
-			for _, a := range active[:limit] {
-				display := a
+		lines = append(lines, sDim.Render(fmt.Sprintf("  Active (%d)", show)))
+		// Always show up to 4 items, pad with blanks if fewer
+		limit := 4
+		for i := 0; i < limit; i++ {
+			if i < show {
+				display := active[i]
 				if len(display) > w-8 {
 					display = display[:w-11] + "..."
 				}
 				lines = append(lines, sDimCyan.Render("    ◌ "+display))
-			}
-			if show > limit {
+			} else if i == 3 && show > limit {
 				lines = append(lines, sDim.Render(fmt.Sprintf("    ... +%d more", show-limit)))
+			} else {
+				lines = append(lines, "")
 			}
+		}
+	} else {
+		// Fixed blank space matching active section height
+		for i := 0; i < 5; i++ {
+			lines = append(lines, "")
 		}
 	}
 
-	// Footer hint
+	// Recently completed — fixed 3 lines
+	lines = append(lines, "")
+	if len(m.recentCompleted) > 0 {
+		lines = append(lines, sGreen.Render(fmt.Sprintf("  ✓ Last: %s", m.recentCompleted[len(m.recentCompleted)-1])))
+	} else {
+		lines = append(lines, "")
+	}
+	if m.progress != nil {
+		lines = append(lines, sDim.Render(fmt.Sprintf("     Processed: %d / %d", m.progress.Current, m.progress.Total)))
+	} else {
+		lines = append(lines, "")
+	}
+
+	// Footer hint — fixed 2 lines
 	if m.taskController != nil {
 		state := m.taskController.GetState()
 		switch state {
@@ -923,7 +1101,11 @@ func (m model) viewRunning(w int) string {
 			lines = append(lines, "", sYellow.Render("  Task is paused. Press [p] to resume, [c] to cancel."))
 		case "cancelled":
 			lines = append(lines, "", sYellow.Render("  Cancelling... waiting for workers to stop."))
+		default:
+			lines = append(lines, "", "")
 		}
+	} else {
+		lines = append(lines, "", "")
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
@@ -1081,4 +1263,56 @@ func updateTaskField(cfg types.AppConfig, taskType types.PypiTaskType, key, valu
 		}
 	}
 	return cfg
+}
+
+// scanSnapshots scans the metadata snapshots directory and returns
+// a sorted list of available snapshots (newest first).
+func scanSnapshots(metadataRoot string) []snapshotEntry {
+	snapshotsRoot := filepath.Join(metadataRoot, "snapshots")
+	entries, err := os.ReadDir(snapshotsRoot)
+	if err != nil {
+		return nil
+	}
+
+	var result []snapshotEntry
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if len(name) < 5 || name[:5] != "pypi-" {
+			continue
+		}
+
+		s := snapshotEntry{name: name}
+
+		// Try to read stats.json for package/file counts
+		statsPath := filepath.Join(snapshotsRoot, name, "stats.json")
+		if data, err := os.ReadFile(statsPath); err == nil {
+			var stats struct {
+				PackagesTotal    int `json:"packagesTotal"`
+				PackagesWithHTML int `json:"packagesWithHtml"`
+				ArtifactsTotal   int `json:"artifactsTotal"`
+			}
+			if err := json.Unmarshal(data, &stats); err == nil {
+				s.packageCount = stats.PackagesTotal
+				s.artifactCount = stats.ArtifactsTotal
+			}
+		}
+
+		// Check for manifest
+		manifestPath := filepath.Join(snapshotsRoot, name, "manifests", "artifacts.jsonl")
+		if fi, err := os.Stat(manifestPath); err == nil && fi.Size() > 0 {
+			s.hasManifest = true
+		}
+
+		result = append(result, s)
+	}
+
+	// Sort newest first (reverse chronological)
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].name > result[j].name
+	})
+
+	return result
 }

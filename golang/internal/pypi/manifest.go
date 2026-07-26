@@ -1,7 +1,6 @@
 package pypi
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,19 +16,6 @@ type BuildManifestOptions struct {
 	SnapshotRoot  string
 	SimpleBaseURL string
 	WriteOutputs  bool
-}
-
-type jsonFileRecord struct {
-	Filename       string             `json:"filename"`
-	URL            string             `json:"url"`
-	Hashes         map[string]string  `json:"hashes,omitempty"`
-	RequiresPython *string            `json:"requires-python,omitempty"`
-	Yanked         interface{}        `json:"yanked,omitempty"`
-	UploadTime     *string            `json:"upload_time,omitempty"`
-}
-
-type jsonIndexPayload struct {
-	Files []jsonFileRecord `json:"files,omitempty"`
 }
 
 // BuildManifestFromSnapshot builds a snapshot manifest by reading snapshot directory.
@@ -57,7 +43,6 @@ func BuildManifestFromSnapshot(opts BuildManifestOptions) (types.SnapshotManifes
 	var packages []types.PackageRecord
 	artifactsMap := make(map[string]types.ArtifactRecord)
 	packagesWithHTML := 0
-	packagesWithJSON := 0
 	artifactsTotal := 0
 
 	if writeOutputs {
@@ -70,52 +55,14 @@ func BuildManifestFromSnapshot(opts BuildManifestOptions) (types.SnapshotManifes
 	for _, pkgName := range pkgDirs {
 		pkgRoot := filepath.Join(simpleRoot, pkgName)
 		htmlPath := filepath.Join(pkgRoot, "index.html")
-		jsonPath := filepath.Join(pkgRoot, "index_v1.json")
 		simplePageURL := buildPackageURL(opts.SimpleBaseURL, pkgName)
 
 		pkgArtifacts := make(map[string]types.ArtifactRecord)
 
-		// Try JSON first
-		if jsonData, err := os.ReadFile(jsonPath); err == nil {
-			var payload jsonIndexPayload
-			if err := json.Unmarshal(jsonData, &payload); err == nil {
-				for _, file := range payload.Files {
-					resolved := ResolveArtifactPath(pkgName, simplePageURL, file.URL)
-					hash := firstHash(file.Hashes)
-
-					record := types.ArtifactRecord{
-						Package:      pkgName,
-						Filename:     file.Filename,
-						RelativePath: resolved.RelativePath,
-						URL:          resolved.RemoteURL,
-						Source:       types.ArtifactSourceJSON,
-						SnapshotID:   snapshotID,
-					}
-					if hash != "" {
-						record.Hash = &hash
-					}
-					if file.RequiresPython != nil {
-						record.RequiresPython = file.RequiresPython
-					}
-					if file.Yanked != nil {
-						record.Yanked = file.Yanked
-					}
-					if file.UploadTime != nil {
-						record.UploadTime = file.UploadTime
-					}
-					pkgArtifacts[resolved.RelativePath] = record
-					artifactsMap[resolved.RelativePath] = record
-				}
-			}
-		}
-
-		// Try HTML for entries not already found in JSON
+		// Read HTML metadata (authoritative source for download links)
 		if htmlData, err := os.ReadFile(htmlPath); err == nil {
 			for _, entry := range ParseSimpleIndexHTML(string(htmlData)) {
 				resolved := ResolveArtifactPath(pkgName, simplePageURL, entry.Href)
-				if _, exists := pkgArtifacts[resolved.RelativePath]; exists {
-					continue
-				}
 
 				hash := ""
 				if idx := strings.IndexByte(entry.Href, '#'); idx >= 0 {
@@ -146,21 +93,16 @@ func BuildManifestFromSnapshot(opts BuildManifestOptions) (types.SnapshotManifes
 		}
 
 		htmlPresent := false
-		jsonPresent := false
 		if _, err := os.Stat(htmlPath); err == nil {
 			htmlPresent = true
 			packagesWithHTML++
-		}
-		if _, err := os.Stat(jsonPath); err == nil {
-			jsonPresent = true
-			packagesWithJSON++
 		}
 
 		pkgRecord := types.PackageRecord{
 			Name:          pkgName,
 			SnapshotID:    snapshotID,
 			HTMLPresent:   htmlPresent,
-			JSONPresent:   jsonPresent,
+			JSONPresent:   false,
 			ArtifactCount: len(pkgArtifacts),
 		}
 		artifactsTotal += len(pkgArtifacts)
@@ -189,10 +131,10 @@ func BuildManifestFromSnapshot(opts BuildManifestOptions) (types.SnapshotManifes
 		})
 	}
 
-	stats := types.SnapshotStats{
+stats := types.SnapshotStats{
 		PackagesTotal:    len(pkgDirs),
 		PackagesWithHTML: packagesWithHTML,
-		PackagesWithJSON: packagesWithJSON,
+		PackagesWithJSON: 0,
 		ArtifactsTotal:   artifactsTotal,
 	}
 
