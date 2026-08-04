@@ -121,13 +121,13 @@ ExcludePackages     = []     # 空 = 不排除
 
 ### 决策 5：输出目录与路径保真
 
-- **输出根目录**：`{mirrorRoot}/pypi-{outputDate}/`（保持现有设计）
+- **输出根目录**：`{mirrorRoot}/{outputDir}/`（`outputDir` 为输出目录名，默认与源快照目录同名，即 `pypi-{metadataDate}`）
 - **packages 相对路径**：必须与元数据 URL 解析出的 `packages/...` 路径完全一致
 
 ```
 远程 URL:  https://pypi.tuna.tsinghua.edu.cn/packages/ab/cd/ef/numpy-1.26.0.whl
                    ↓ 解析出 relativePath = "packages/ab/cd/ef/numpy-1.26.0.whl"
-本地存储:  {mirrorRoot}/pypi-{outputDate}/packages/ab/cd/ef/numpy-1.26.0.whl
+本地存储:  {mirrorRoot}/{outputDir}/packages/ab/cd/ef/numpy-1.26.0.whl
 ```
 
 这一策略由 `pypi.ResolveArtifactPath()`（`internal/pypi/path.go`）保证，下载器直接使用解析出的 `RelativePath`，不自行拼接路径。
@@ -260,7 +260,7 @@ Consumer goroutine 启动 → 立即取包并发下载
 ## 4. 状态文件布局
 
 ```
-{mirrorRoot}/pypi-{outputDate}/
+{mirrorRoot}/{outputDir}/
   packages/                          # 下载的包文件
     ab/cd/ef/numpy-1.26.0-...        # 路径与 URL 相对路径一致
     ...
@@ -412,7 +412,7 @@ mirror-sync artifact-download -m 2026-07-25
   "pypi": {
     "artifactDownload": {
       "metadataDate": "2026-07-25",
-      "outputDate": "2026-07-25"
+      "outputDir": "pypi-2026-07-25"
     },
     "filter": {
       "includeSource": true,

@@ -174,9 +174,14 @@ func loadPackageListCount(snapshotRoot string) int {
 
 func runArtifactDownload(cfg types.AppConfig, onEvent func(SyncEvent), tc types.Canceller) (types.SyncRunResult, error) {
 	metadataDate := cfg.PyPI.ArtifactDownload.MetadataDate
-	outputDate := cfg.PyPI.ArtifactDownload.OutputDate
+	outputDir := cfg.PyPI.ArtifactDownload.OutputDir
+	if outputDir == "" {
+		// Defensive: RunSync normally normalizes this, but keep a safe default
+		// that matches the snapshot directory name.
+		outputDir = config.FallbackOutputDir(metadataDate, "")
+	}
 	snapshotRoot := config.BuildSnapshotRoot(cfg.Base.MetadataRoot, metadataDate)
-	outputRoot := config.BuildMirrorOutputRoot(cfg.Base.MirrorRoot, outputDate)
+	outputRoot := filepath.Join(cfg.Base.MirrorRoot, outputDir)
 	stateDir := filepath.Join(outputRoot, "state")
 
 	emit(onEvent, "Prepare", fmt.Sprintf("PyPI / %s", config.TaskLabel(types.PypiTaskArtifactDownload)), nil)
@@ -195,6 +200,13 @@ func runArtifactDownload(cfg types.AppConfig, onEvent func(SyncEvent), tc types.
 		return types.SyncRunResult{}, fmt.Errorf("init state store: %w", err)
 	}
 	defer stateStore.Close()
+
+	// Report resume state so the user sees downloads continue from checkpoint.
+	if n := checkpointStore.Count(); n > 0 {
+		emit(onEvent, "Resume", fmt.Sprintf("Checkpoint found: %d package(s) already completed — skipping them", n), nil)
+	} else {
+		emit(onEvent, "Resume", "No checkpoint yet — starting fresh", nil)
+	}
 
 	// Get total package estimation from package-list.txt
 	totalEstimate := loadPackageListCount(snapshotRoot)
@@ -324,10 +336,12 @@ func runArtifactDownload(cfg types.AppConfig, onEvent func(SyncEvent), tc types.
 
 				if len(pkgEntries) == 0 {
 					// All files already exist
-					_ = checkpointStore.CompletePackage(downloader.PackageCheckpoint{
+					if err := checkpointStore.CompletePackage(downloader.PackageCheckpoint{
 						Package: group.Package, CompletedAt: time.Now().UTC(),
 						Files: len(group.Artifacts), Bytes: 0,
-					})
+					}); err != nil {
+						emit(onEvent, "Warning", fmt.Sprintf("checkpoint write failed for %s: %v", group.Package, err), nil)
+					}
 					activeMu.Lock()
 					delete(activePkgs, group.Package)
 					activeMu.Unlock()
@@ -378,10 +392,12 @@ func runArtifactDownload(cfg types.AppConfig, onEvent func(SyncEvent), tc types.
 					failedMu.Unlock()
 					failed.Add(1)
 				} else {
-					_ = checkpointStore.CompletePackage(downloader.PackageCheckpoint{
+					if err := checkpointStore.CompletePackage(downloader.PackageCheckpoint{
 						Package: group.Package, CompletedAt: time.Now().UTC(),
 						Files: len(group.Artifacts), Bytes: 0,
-					})
+					}); err != nil {
+						emit(onEvent, "Warning", fmt.Sprintf("checkpoint write failed for %s: %v", group.Package, err), nil)
+					}
 				}
 				completed.Add(1)
 				emit(onEvent, "Download",
@@ -421,7 +437,7 @@ func runArtifactDownload(cfg types.AppConfig, onEvent func(SyncEvent), tc types.
 		"provider":          "pypi",
 		"taskType":          "artifact-download",
 		"metadataDate":      metadataDate,
-		"outputDate":        outputDate,
+		"outputDir":         outputDir,
 		"outputRoot":        outputRoot,
 		"packagesTotal":     completedVal,
 		"packagesCompleted": completedVal - failedVal,

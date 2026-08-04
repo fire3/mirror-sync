@@ -167,7 +167,9 @@ type MetadataSyncTaskConfig struct {
 // ArtifactDownloadTaskConfig configures an artifact download task.
 type ArtifactDownloadTaskConfig struct {
 	MetadataDate string `json:"-"`
-	OutputDate   string `json:"-"`
+	// OutputDir is the mirror output directory name (e.g. "pypi-2025-07-25").
+	// Defaults to the same name as the source snapshot directory.
+	OutputDir string `json:"-"`
 }
 
 // IncrementalDownloadTaskConfig configures an incremental download task.

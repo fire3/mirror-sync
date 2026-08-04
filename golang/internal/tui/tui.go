@@ -65,7 +65,7 @@ var taskDefs = []taskDef{
 		label:       "按单日快照下载包",
 		description: "根据指定日期的元数据快照，下载全部包文件。",
 		fields: []fieldDef{
-			{key: "outputDate", label: "Output Date"},
+			{key: "outputDir", label: "Output Dir"},
 		},
 	},
 	{
@@ -328,7 +328,10 @@ func (m *model) resetDates() {
 	if m.cfg.PyPI.ArtifactDownload.MetadataDate == "" {
 		m.cfg.PyPI.ArtifactDownload.MetadataDate = today
 	}
-	m.cfg.PyPI.ArtifactDownload.OutputDate = today
+	if m.cfg.PyPI.ArtifactDownload.OutputDir == "" {
+		// Default output dir matches the snapshot directory name.
+		m.cfg.PyPI.ArtifactDownload.OutputDir = config.FallbackOutputDir(m.cfg.PyPI.ArtifactDownload.MetadataDate, "")
+	}
 	if m.cfg.PyPI.IncrementalDownload.OldMetadataDate == "" {
 		m.cfg.PyPI.IncrementalDownload.OldMetadataDate = today
 	}
@@ -504,6 +507,8 @@ func (m model) handleSnapshot(key string, keyType tea.KeyType) (tea.Model, tea.C
 			dateStr = dateStr[5:]
 		}
 		m.cfg.PyPI.ArtifactDownload.MetadataDate = dateStr
+		// Default output dir matches the snapshot directory name.
+		m.cfg.PyPI.ArtifactDownload.OutputDir = config.FallbackOutputDir(dateStr, "")
 		m.screen = screenConfig
 		m.configSection = configTask
 		m.baseFieldIdx = 0
@@ -964,32 +969,47 @@ func (m model) viewConfirm(w int) string {
 	cfg := m.cfg
 	task := taskDefs[m.taskIdx]
 
+	item := func(label, value string) string {
+		return fmt.Sprintf("%-15s %s", label+":", value)
+	}
+
 	var items []string
 	items = append(items,
-		fmt.Sprintf("Provider:    PyPI"),
-		fmt.Sprintf("Task:        %s", task.label),
-		fmt.Sprintf("Simple URL:  %s", cfg.Base.SimpleURL),
-		fmt.Sprintf("Concurrency: %d", cfg.Base.Concurrency),
-		fmt.Sprintf("Retry:       %d", cfg.Base.Retry),
-		fmt.Sprintf("Timeout:     %dms", cfg.Base.TimeoutMs),
+		item("Provider", "PyPI"),
+		item("Task", task.label),
+		item("Simple URL", cfg.Base.SimpleURL),
+		item("Metadata Root", cfg.Base.MetadataRoot),
+		item("Mirror Root", cfg.Base.MirrorRoot),
+		item("Concurrency", fmt.Sprintf("%d", cfg.Base.Concurrency)),
+		item("Retry", fmt.Sprintf("%d", cfg.Base.Retry)),
+		item("Timeout", fmt.Sprintf("%dms", cfg.Base.TimeoutMs)),
 	)
 
 	// Task-specific params
 	switch cfg.SelectedTask {
 	case types.PypiTaskMetadataSync:
 		// Always use today — no config needed
-		items = append(items, fmt.Sprintf("Snapshot:    %s", config.BuildSnapshotID(time.Now())))
-	case types.PypiTaskArtifactDownload:
+		snapshotID := config.BuildSnapshotID(time.Now())
 		items = append(items,
-			fmt.Sprintf("Source Date: %s", cfg.PyPI.ArtifactDownload.MetadataDate),
-			fmt.Sprintf("Output Date: %s", cfg.PyPI.ArtifactDownload.OutputDate),
-			fmt.Sprintf("Snapshot:   pypi-%s", cfg.PyPI.ArtifactDownload.MetadataDate),
+			item("Snapshot", snapshotID),
+			item("Snapshot Root", config.BuildSnapshotRoot(cfg.Base.MetadataRoot, snapshotID)),
+		)
+	case types.PypiTaskArtifactDownload:
+		md := cfg.PyPI.ArtifactDownload.MetadataDate
+		outDir := cfg.PyPI.ArtifactDownload.OutputDir
+		items = append(items,
+			item("Source Date", md),
+			item("Snapshot", "pypi-"+md),
+			item("Snapshot Root", config.BuildSnapshotRoot(cfg.Base.MetadataRoot, md)),
+			item("Output Dir", outDir),
+			item("Output Root", filepath.Join(cfg.Base.MirrorRoot, outDir)),
 		)
 	case types.PypiTaskIncrementalDownload:
 		items = append(items,
-			fmt.Sprintf("Old Date:    %s", cfg.PyPI.IncrementalDownload.OldMetadataDate),
-			fmt.Sprintf("New Date:    %s", cfg.PyPI.IncrementalDownload.NewMetadataDate),
-			fmt.Sprintf("Output Date: %s", cfg.PyPI.IncrementalDownload.OutputDate),
+			item("Old Date", cfg.PyPI.IncrementalDownload.OldMetadataDate),
+			item("New Date", cfg.PyPI.IncrementalDownload.NewMetadataDate),
+			item("Output Date", cfg.PyPI.IncrementalDownload.OutputDate),
+			item("Output Root", config.BuildMirrorOutputRoot(cfg.Base.MirrorRoot, cfg.PyPI.IncrementalDownload.OutputDate)),
 		)
 	}
 
@@ -1223,8 +1243,8 @@ func getTaskFieldValue(cfg types.AppConfig, taskType types.PypiTaskType, key str
 		switch key {
 		case "metadataDate":
 			return cfg.PyPI.ArtifactDownload.MetadataDate
-		case "outputDate":
-			return cfg.PyPI.ArtifactDownload.OutputDate
+		case "outputDir":
+			return cfg.PyPI.ArtifactDownload.OutputDir
 		}
 	case types.PypiTaskIncrementalDownload:
 		switch key {
@@ -1249,8 +1269,10 @@ func updateTaskField(cfg types.AppConfig, taskType types.PypiTaskType, key, valu
 		switch key {
 		case "metadataDate":
 			cfg.PyPI.ArtifactDownload.MetadataDate = value
-		case "outputDate":
-			cfg.PyPI.ArtifactDownload.OutputDate = value
+			// Default output dir matches the snapshot directory name.
+			cfg.PyPI.ArtifactDownload.OutputDir = config.FallbackOutputDir(value, "")
+		case "outputDir":
+			cfg.PyPI.ArtifactDownload.OutputDir = value
 		}
 	case types.PypiTaskIncrementalDownload:
 		switch key {

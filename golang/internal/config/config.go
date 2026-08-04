@@ -46,7 +46,10 @@ func DefaultConfig() types.AppConfig {
 			},
 			ArtifactDownload: types.ArtifactDownloadTaskConfig{
 				MetadataDate: "",
-				OutputDate:   snapshotID,
+				// OutputDir defaults to the source snapshot directory name
+				// (pypi-<metadataDate>); derived in NormalizeConfig, not preset
+				// to today so it always matches the chosen snapshot.
+				OutputDir: "",
 			},
 			IncrementalDownload: types.IncrementalDownloadTaskConfig{
 				OldMetadataDate: "",
@@ -135,7 +138,8 @@ func NormalizeConfig(cfg types.AppConfig) types.AppConfig {
 			},
 			ArtifactDownload: types.ArtifactDownloadTaskConfig{
 				MetadataDate: fallbackDate(cfg.PyPI.ArtifactDownload.MetadataDate),
-				OutputDate:   fallbackDate(cfg.PyPI.ArtifactDownload.OutputDate),
+				// Default output dir matches the snapshot directory name.
+				OutputDir: FallbackOutputDir(cfg.PyPI.ArtifactDownload.MetadataDate, cfg.PyPI.ArtifactDownload.OutputDir),
 			},
 			IncrementalDownload: types.IncrementalDownloadTaskConfig{
 				OldMetadataDate: fallbackDate(cfg.PyPI.IncrementalDownload.OldMetadataDate),
@@ -144,6 +148,16 @@ func NormalizeConfig(cfg types.AppConfig) types.AppConfig {
 			},
 		},
 	}
+}
+
+// FallbackOutputDir returns the output directory name for artifact download.
+// If empty, it defaults to the same name as the source snapshot directory
+// (e.g. "pypi-2025-07-25" when the metadata date is 2025-07-25).
+func FallbackOutputDir(metadataDate, outputDir string) string {
+	if trimmed := strings.TrimSpace(outputDir); trimmed != "" {
+		return trimmed
+	}
+	return "pypi-" + fallbackDate(metadataDate)
 }
 
 func isFinite(f float64) bool {
@@ -176,8 +190,8 @@ func LoadConfig(configPath string) (types.AppConfig, error) {
 	if parsed.PyPI.MetadataSync.SnapshotDate == "" {
 		parsed.PyPI.MetadataSync = def.PyPI.MetadataSync
 	}
-	if parsed.PyPI.ArtifactDownload.OutputDate == "" {
-		parsed.PyPI.ArtifactDownload.OutputDate = def.PyPI.ArtifactDownload.OutputDate
+	if parsed.PyPI.ArtifactDownload.OutputDir == "" {
+		parsed.PyPI.ArtifactDownload.OutputDir = FallbackOutputDir(parsed.PyPI.ArtifactDownload.MetadataDate, "")
 	}
 	if parsed.PyPI.IncrementalDownload.OutputDate == "" {
 		parsed.PyPI.IncrementalDownload.OutputDate = def.PyPI.IncrementalDownload.OutputDate

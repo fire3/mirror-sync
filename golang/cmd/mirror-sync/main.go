@@ -34,6 +34,7 @@ func parseFlags() (types.AppConfig, bool) {
 		taskStr      string
 		metadataDate string
 		outputDate   string
+		outputDir    string
 		oldDate      string
 		newDate      string
 		concurrency  int
@@ -83,6 +84,11 @@ func parseFlags() (types.AppConfig, bool) {
 			if i+1 < len(args) {
 				i++
 				outputDate = args[i]
+			}
+		case arg == "--output-dir":
+			if i+1 < len(args) {
+				i++
+				outputDir = args[i]
 			}
 		case arg == "--old-date" || arg == "-a":
 			if i+1 < len(args) {
@@ -137,12 +143,19 @@ func parseFlags() (types.AppConfig, bool) {
 			cfg.PyPI.MetadataSync.SnapshotDate = metadataDate
 		}
 	case "artifact-download", "artifact":
+		if outputDate != "" {
+			fmt.Fprintln(os.Stderr, "Error: --output-date/-o is only for incremental-download; use --output-dir for artifact-download")
+			os.Exit(1)
+		}
 		cfg.SelectedTask = types.PypiTaskArtifactDownload
 		if metadataDate != "" {
 			cfg.PyPI.ArtifactDownload.MetadataDate = metadataDate
 		}
-		if outputDate != "" {
-			cfg.PyPI.ArtifactDownload.OutputDate = outputDate
+		if outputDir != "" {
+			cfg.PyPI.ArtifactDownload.OutputDir = outputDir
+		} else if metadataDate != "" {
+			// Default output dir matches the snapshot directory name.
+			cfg.PyPI.ArtifactDownload.OutputDir = config.FallbackOutputDir(metadataDate, "")
 		}
 	case "incremental-download", "incremental":
 		cfg.SelectedTask = types.PypiTaskIncrementalDownload
@@ -187,7 +200,8 @@ Tasks:
 
 Task-specific options:
   --metadata-date, -m  指定元数据日期 (YYYY-MM-DD)
-  --output-date, -o    指定输出日期 (YYYY-MM-DD)
+  --output-dir         指定输出目录名 (默认: pypi-<元数据日期>)
+  --output-date, -o    指定输出日期 (YYYY-MM-DD, 仅 incremental 使用)
   --old-date, -a       旧元数据日期 (for incremental)
   --new-date, -b       新元数据日期 (for incremental)
 
@@ -203,7 +217,8 @@ Examples:
   mirror-sync                                          # 启动 TUI
   mirror-sync metadata-sync                            # 下载今日元数据
   mirror-sync meta -m 2025-07-25                       # 下载指定日期的元数据
-  mirror-sync artifact -m 2025-07-25 -o 2025-07-25     # 按元数据下载包
+  mirror-sync artifact -m 2025-07-25                        # 按元数据下载包 (输出到 pypi-2025-07-25)
+  mirror-sync artifact -m 2025-07-25 --output-dir pypi-mirror # 按元数据下载包到自定义目录
   mirror-sync incremental -a 2025-07-24 -b 2025-07-25 -o 2025-07-25
 `)
 }

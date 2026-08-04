@@ -101,6 +101,14 @@ func (cs *CheckpointStore) CompletePackage(pkg PackageCheckpoint) error {
 		return err
 	}
 
+	// Flush immediately: the process may be killed or the TUI may quit at any
+	// time (defer Close() may never run), so a completed package must survive
+	// a process kill right away for resume-after-restart to work. Note this is
+	// a buf flush, not fsync — it does not guard against OS crash / power loss.
+	if err := cs.buf.Flush(); err != nil {
+		return err
+	}
+
 	cs.completed[pkg.Package] = struct{}{}
 	return nil
 }
