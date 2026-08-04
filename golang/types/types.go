@@ -122,6 +122,9 @@ type DownloaderOptions struct {
 type DownloadFailedEntry struct {
 	Entry DownloadPlanEntry `json:"entry"`
 	Error string            `json:"error"`
+	// NotFound is true when the failure was a deterministic 404 (the file
+	// does not exist upstream); such failures are not retried.
+	NotFound bool `json:"notFound,omitempty"`
 }
 
 // DownloadSummary is the result of executing a download plan.

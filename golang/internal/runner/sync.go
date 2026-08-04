@@ -203,9 +203,9 @@ func runArtifactDownload(cfg types.AppConfig, onEvent func(SyncEvent), tc types.
 
 	// Report resume state so the user sees downloads continue from checkpoint.
 	if n := checkpointStore.Count(); n > 0 {
-		emit(onEvent, "Resume", fmt.Sprintf("Checkpoint found: %d package(s) already completed — skipping them", n), nil)
+		emit(onEvent, "Resume", fmt.Sprintf("Checkpoint found at %s: %d package(s) already completed — skipping them", checkpointPath, n), nil)
 	} else {
-		emit(onEvent, "Resume", "No checkpoint yet — starting fresh", nil)
+		emit(onEvent, "Resume", fmt.Sprintf("No checkpoint at %s — starting fresh", checkpointPath), nil)
 	}
 
 	// Get total package estimation from package-list.txt
@@ -386,7 +386,11 @@ func runArtifactDownload(cfg types.AppConfig, onEvent func(SyncEvent), tc types.
 				if len(summary.Failed) > 0 {
 					failedMu.Lock()
 					for _, f := range summary.Failed {
-						_ = stateStore.RecordFailed(f.Entry.Package, f.Entry.Filename, f.Entry.RelativePath, f.Error)
+						if f.NotFound {
+							_ = stateStore.RecordNotFound(f.Entry.Package, f.Entry.Filename, f.Entry.RelativePath, f.Entry.URL)
+						} else {
+							_ = stateStore.RecordFailed(f.Entry.Package, f.Entry.Filename, f.Entry.RelativePath, f.Error)
+						}
 					}
 					allFailed = append(allFailed, summary.Failed...)
 					failedMu.Unlock()
