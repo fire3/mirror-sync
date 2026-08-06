@@ -1,6 +1,10 @@
 package planner
 
-import "github.com/user/mirror-sync/types"
+import (
+	"sort"
+
+	"github.com/user/mirror-sync/types"
+)
 
 // artifactChanged returns true if two artifact records differ.
 func artifactChanged(previous, current types.ArtifactRecord) bool {
@@ -8,6 +12,42 @@ func artifactChanged(previous, current types.ArtifactRecord) bool {
 		return *previous.Hash != *current.Hash
 	}
 	return previous.URL != current.URL || previous.Filename != current.Filename
+}
+
+// packageNameSet returns the set of package names in a manifest. It prefers
+// the Packages records and falls back to deriving names from artifacts (for
+// manifests that only carry artifact records).
+func packageNameSet(m types.SnapshotManifest) map[string]struct{} {
+	set := make(map[string]struct{}, len(m.Packages))
+	for _, p := range m.Packages {
+		set[p.Name] = struct{}{}
+	}
+	if len(set) == 0 {
+		for _, a := range m.Artifacts {
+			set[a.Package] = struct{}{}
+		}
+	}
+	return set
+}
+
+// diffPackages computes the added/removed package name sets between two
+// manifests and returns them sorted.
+func diffPackages(oldManifest, newManifest types.SnapshotManifest) (added, removed []string) {
+	oldSet := packageNameSet(oldManifest)
+	newSet := packageNameSet(newManifest)
+	for name := range newSet {
+		if _, ok := oldSet[name]; !ok {
+			added = append(added, name)
+		}
+	}
+	for name := range oldSet {
+		if _, ok := newSet[name]; !ok {
+			removed = append(removed, name)
+		}
+	}
+	sort.Strings(added)
+	sort.Strings(removed)
+	return added, removed
 }
 
 // DiffSnapshotManifests computes the diff between two snapshot manifests.
@@ -43,10 +83,14 @@ func DiffSnapshotManifests(oldManifest, newManifest types.SnapshotManifest) type
 		}
 	}
 
+	addedPackages, removedPackages := diffPackages(oldManifest, newManifest)
+
 	return types.SnapshotDiff{
-		Added:     added,
-		Changed:   changed,
-		Removed:   removed,
-		Unchanged: unchanged,
+		AddedPackages:   addedPackages,
+		RemovedPackages: removedPackages,
+		Added:           added,
+		Changed:         changed,
+		Removed:         removed,
+		Unchanged:       unchanged,
 	}
 }

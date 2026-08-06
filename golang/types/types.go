@@ -49,10 +49,14 @@ type SnapshotManifest struct {
 
 // SnapshotDiff represents the diff between two snapshot manifests.
 type SnapshotDiff struct {
-	Added     []ArtifactRecord             `json:"added"`
-	Changed   []ArtifactChange             `json:"changed"`
-	Removed   []ArtifactRecord             `json:"removed"`
-	Unchanged []ArtifactRecord             `json:"unchanged"`
+	// AddedPackages are packages present in the new snapshot but not the old.
+	AddedPackages []string `json:"addedPackages"`
+	// RemovedPackages are packages present in the old snapshot but not the new.
+	RemovedPackages []string `json:"removedPackages"`
+	Added           []ArtifactRecord `json:"added"`
+	Changed         []ArtifactChange `json:"changed"`
+	Removed         []ArtifactRecord `json:"removed"`
+	Unchanged       []ArtifactRecord `json:"unchanged"`
 }
 
 // ArtifactChange represents an artifact that changed between snapshots.
@@ -179,7 +183,14 @@ type ArtifactDownloadTaskConfig struct {
 type IncrementalDownloadTaskConfig struct {
 	OldMetadataDate string `json:"-"`
 	NewMetadataDate string `json:"-"`
-	OutputDate      string `json:"-"`
+	// OutputDir is the mirror output directory name
+	// (e.g. "pypi-diff-2025-07-25-2025-07-24"). Defaults to
+	// "pypi-diff-{newDate}-{oldDate}".
+	OutputDir string `json:"-"`
+	// CleanupRoot is the old mirror directory that the generated cleanup
+	// script targets (e.g. {mirrorRoot}/pypi-{oldDate}). Defaults to the
+	// old-date mirror directory; the script is generated but never executed.
+	CleanupRoot string `json:"-"`
 }
 
 // PypiTaskConfigs holds all PyPI task configs.
@@ -198,14 +209,21 @@ type AppConfig struct {
 
 // SyncRunResult holds the result of a sync run.
 type SyncRunResult struct {
-	Provider       ProviderType       `json:"provider"`
-	TaskType       PypiTaskType       `json:"taskType"`
-	SnapshotID     *string            `json:"snapshotId,omitempty"`
-	SnapshotRoot   *string            `json:"snapshotRoot,omitempty"`
-	PackageCount   *int               `json:"packageCount,omitempty"`
-	Manifest       *SnapshotManifest  `json:"manifest,omitempty"`
-	Plan           *DownloadPlan      `json:"plan,omitempty"`
-	Diff           *SnapshotDiff      `json:"diff,omitempty"`
-	DownloadSummary *DownloadSummary  `json:"downloadSummary,omitempty"`
-	OutputRoot     *string            `json:"outputRoot,omitempty"`
+	Provider            ProviderType      `json:"provider"`
+	TaskType            PypiTaskType      `json:"taskType"`
+	SnapshotID          *string           `json:"snapshotId,omitempty"`
+	SnapshotRoot        *string           `json:"snapshotRoot,omitempty"`
+	PackageCount        *int              `json:"packageCount,omitempty"`
+	Manifest            *SnapshotManifest `json:"manifest,omitempty"`
+	Plan                *DownloadPlan     `json:"plan,omitempty"`
+	Diff                *SnapshotDiff     `json:"diff,omitempty"`
+	DownloadSummary     *DownloadSummary  `json:"downloadSummary,omitempty"`
+	OutputRoot          *string           `json:"outputRoot,omitempty"`
+	DiffReportPath       *string `json:"diffReportPath,omitempty"`
+	CleanupScriptPath    *string `json:"cleanupScriptPath,omitempty"`
+	RemovedPackageCount  *int    `json:"removedPackageCount,omitempty"`
+	RemovedArtifactCount *int    `json:"removedArtifactCount,omitempty"`
+	// RemovedArtifactSkippedCount counts removed artifacts that were
+	// excluded from the cleanup script (filtered out or non-packages/ paths).
+	RemovedArtifactSkippedCount *int `json:"removedArtifactSkippedCount,omitempty"`
 }

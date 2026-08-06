@@ -71,11 +71,11 @@ var taskDefs = []taskDef{
 	{
 		id:          types.PypiTaskIncrementalDownload,
 		label:       "增量下载 (两份快照对比)",
-		description: "对比两个快照，只下载新增或变更的包。",
+		description: "对比两个快照，下载新增/变更文件并生成删除脚本。",
 		fields: []fieldDef{
 			{key: "oldMetadataDate", label: "Old Date"},
 			{key: "newMetadataDate", label: "New Date"},
-			{key: "outputDate", label: "Output Date"},
+			{key: "outputDir", label: "Output Dir"},
 		},
 	},
 }
@@ -338,7 +338,15 @@ func (m *model) resetDates() {
 	if m.cfg.PyPI.IncrementalDownload.NewMetadataDate == "" {
 		m.cfg.PyPI.IncrementalDownload.NewMetadataDate = today
 	}
-	m.cfg.PyPI.IncrementalDownload.OutputDate = today
+	if m.cfg.PyPI.IncrementalDownload.OutputDir == "" {
+		m.cfg.PyPI.IncrementalDownload.OutputDir = config.FallbackIncrementalOutputDir(
+			m.cfg.PyPI.IncrementalDownload.NewMetadataDate,
+			m.cfg.PyPI.IncrementalDownload.OldMetadataDate, "")
+	}
+	if m.cfg.PyPI.IncrementalDownload.CleanupRoot == "" {
+		m.cfg.PyPI.IncrementalDownload.CleanupRoot = config.FallbackCleanupRoot(
+			m.cfg.Base.MirrorRoot, m.cfg.PyPI.IncrementalDownload.OldMetadataDate, "")
+	}
 }
 
 // ── Key dispatch ───────────────────────────────────────────────────────────
@@ -1005,11 +1013,21 @@ func (m model) viewConfirm(w int) string {
 			item("Output Root", filepath.Join(cfg.Base.MirrorRoot, outDir)),
 		)
 	case types.PypiTaskIncrementalDownload:
+		outDir := cfg.PyPI.IncrementalDownload.OutputDir
+		cleanupRoot := cfg.PyPI.IncrementalDownload.CleanupRoot
 		items = append(items,
 			item("Old Date", cfg.PyPI.IncrementalDownload.OldMetadataDate),
 			item("New Date", cfg.PyPI.IncrementalDownload.NewMetadataDate),
-			item("Output Date", cfg.PyPI.IncrementalDownload.OutputDate),
-			item("Output Root", config.BuildMirrorOutputRoot(cfg.Base.MirrorRoot, cfg.PyPI.IncrementalDownload.OutputDate)),
+			item("Output Dir", outDir),
+			item("Output Root", filepath.Join(cfg.Base.MirrorRoot, outDir)),
+		)
+		// Cleanup target confirmation（决策 4）：提示用户确认清理根目录
+		// 指向旧日期的 pypi mirror；脚本只生成不执行。
+		items = append(items,
+			"",
+			sYellow.Render(fmt.Sprintf(
+				"  ⚠ 删除脚本将针对 Cleanup Root:\n  %s\n  请确认该目录是 %s 的 pypi mirror（脚本仅生成, 不会执行）",
+				cleanupRoot, cfg.PyPI.IncrementalDownload.OldMetadataDate)),
 		)
 	}
 
@@ -1176,6 +1194,17 @@ func (m model) viewDone(w int) string {
 				fmt.Sprintf("  Failed:     %d", len(ds.Failed)),
 			)
 		}
+		if r.Diff != nil {
+			lines = append(lines, fmt.Sprintf("  Diff:     +%d/-%d packages, +%d/~%d/-%d artifacts",
+				len(r.Diff.AddedPackages), len(r.Diff.RemovedPackages),
+				len(r.Diff.Added), len(r.Diff.Changed), len(r.Diff.Removed)))
+		}
+		if r.CleanupScriptPath != nil {
+			lines = append(lines, fmt.Sprintf("  Cleanup:  %s (未执行)", *r.CleanupScriptPath))
+		}
+		if r.RemovedArtifactSkippedCount != nil && *r.RemovedArtifactSkippedCount > 0 {
+			lines = append(lines, fmt.Sprintf("  Cleanup Skipped: %d (过滤/非 packages/ 路径)", *r.RemovedArtifactSkippedCount))
+		}
 		if r.OutputRoot != nil {
 			lines = append(lines, fmt.Sprintf("  Output:  %s", *r.OutputRoot))
 		}
@@ -1252,8 +1281,8 @@ func getTaskFieldValue(cfg types.AppConfig, taskType types.PypiTaskType, key str
 			return cfg.PyPI.IncrementalDownload.OldMetadataDate
 		case "newMetadataDate":
 			return cfg.PyPI.IncrementalDownload.NewMetadataDate
-		case "outputDate":
-			return cfg.PyPI.IncrementalDownload.OutputDate
+		case "outputDir":
+			return cfg.PyPI.IncrementalDownload.OutputDir
 		}
 	}
 	return ""
@@ -1277,11 +1306,27 @@ func updateTaskField(cfg types.AppConfig, taskType types.PypiTaskType, key, valu
 	case types.PypiTaskIncrementalDownload:
 		switch key {
 		case "oldMetadataDate":
+			prevOld := cfg.PyPI.IncrementalDownload.OldMetadataDate
 			cfg.PyPI.IncrementalDownload.OldMetadataDate = value
+			// Only refresh derived values while they still match the
+			// previous derivation; a user-typed custom value is preserved.
+			if cfg.PyPI.IncrementalDownload.OutputDir == "" ||
+				cfg.PyPI.IncrementalDownload.OutputDir == config.FallbackIncrementalOutputDir(cfg.PyPI.IncrementalDownload.NewMetadataDate, prevOld, "") {
+				cfg.PyPI.IncrementalDownload.OutputDir = config.FallbackIncrementalOutputDir(cfg.PyPI.IncrementalDownload.NewMetadataDate, value, "")
+			}
+			if cfg.PyPI.IncrementalDownload.CleanupRoot == "" ||
+				cfg.PyPI.IncrementalDownload.CleanupRoot == config.FallbackCleanupRoot(cfg.Base.MirrorRoot, prevOld, "") {
+				cfg.PyPI.IncrementalDownload.CleanupRoot = config.FallbackCleanupRoot(cfg.Base.MirrorRoot, value, "")
+			}
 		case "newMetadataDate":
+			prevNew := cfg.PyPI.IncrementalDownload.NewMetadataDate
 			cfg.PyPI.IncrementalDownload.NewMetadataDate = value
-		case "outputDate":
-			cfg.PyPI.IncrementalDownload.OutputDate = value
+			if cfg.PyPI.IncrementalDownload.OutputDir == "" ||
+				cfg.PyPI.IncrementalDownload.OutputDir == config.FallbackIncrementalOutputDir(prevNew, cfg.PyPI.IncrementalDownload.OldMetadataDate, "") {
+				cfg.PyPI.IncrementalDownload.OutputDir = config.FallbackIncrementalOutputDir(value, cfg.PyPI.IncrementalDownload.OldMetadataDate, "")
+			}
+		case "outputDir":
+			cfg.PyPI.IncrementalDownload.OutputDir = value
 		}
 	}
 	return cfg

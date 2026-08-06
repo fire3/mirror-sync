@@ -35,6 +35,7 @@ func parseFlags() (types.AppConfig, bool) {
 		metadataDate string
 		outputDate   string
 		outputDir    string
+		cleanupRoot  string
 		oldDate      string
 		newDate      string
 		concurrency  int
@@ -90,6 +91,11 @@ func parseFlags() (types.AppConfig, bool) {
 				i++
 				outputDir = args[i]
 			}
+		case arg == "--cleanup-root":
+			if i+1 < len(args) {
+				i++
+				cleanupRoot = args[i]
+			}
 		case arg == "--old-date" || arg == "-a":
 			if i+1 < len(args) {
 				i++
@@ -144,7 +150,7 @@ func parseFlags() (types.AppConfig, bool) {
 		}
 	case "artifact-download", "artifact":
 		if outputDate != "" {
-			fmt.Fprintln(os.Stderr, "Error: --output-date/-o is only for incremental-download; use --output-dir for artifact-download")
+			fmt.Fprintln(os.Stderr, "Error: --output-date/-o is removed; use --output-dir instead")
 			os.Exit(1)
 		}
 		cfg.SelectedTask = types.PypiTaskArtifactDownload
@@ -159,14 +165,21 @@ func parseFlags() (types.AppConfig, bool) {
 		}
 	case "incremental-download", "incremental":
 		cfg.SelectedTask = types.PypiTaskIncrementalDownload
+		if outputDate != "" {
+			fmt.Fprintln(os.Stderr, "Error: --output-date/-o is removed; use --output-dir instead")
+			os.Exit(1)
+		}
 		if oldDate != "" {
 			cfg.PyPI.IncrementalDownload.OldMetadataDate = oldDate
 		}
 		if newDate != "" {
 			cfg.PyPI.IncrementalDownload.NewMetadataDate = newDate
 		}
-		if outputDate != "" {
-			cfg.PyPI.IncrementalDownload.OutputDate = outputDate
+		if outputDir != "" {
+			cfg.PyPI.IncrementalDownload.OutputDir = outputDir
+		}
+		if cleanupRoot != "" {
+			cfg.PyPI.IncrementalDownload.CleanupRoot = cleanupRoot
 		}
 	default:
 		fmt.Fprintf(os.Stderr, "Error: unknown task %q\n", taskStr)
@@ -200,10 +213,10 @@ Tasks:
 
 Task-specific options:
   --metadata-date, -m  指定元数据日期 (YYYY-MM-DD)
-  --output-dir         指定输出目录名 (默认: pypi-<元数据日期>)
-  --output-date, -o    指定输出日期 (YYYY-MM-DD, 仅 incremental 使用)
+  --output-dir         指定输出目录名 (默认: pypi-<元数据日期>; incremental 默认: pypi-diff-<新日期>-<旧日期>)
   --old-date, -a       旧元数据日期 (for incremental)
   --new-date, -b       新元数据日期 (for incremental)
+  --cleanup-root       删除脚本目标根目录 (默认: <mirrorRoot>/pypi-<旧日期>, 仅 incremental)
 
 Global options:
   --concurrency, -c  并发数 (default: 16)
@@ -219,7 +232,9 @@ Examples:
   mirror-sync meta -m 2025-07-25                       # 下载指定日期的元数据
   mirror-sync artifact -m 2025-07-25                        # 按元数据下载包 (输出到 pypi-2025-07-25)
   mirror-sync artifact -m 2025-07-25 --output-dir pypi-mirror # 按元数据下载包到自定义目录
-  mirror-sync incremental -a 2025-07-24 -b 2025-07-25 -o 2025-07-25
+  mirror-sync incremental -a 2025-07-24 -b 2025-07-25        # 快照对比: 下载增量到 pypi-diff-2025-07-25-2025-07-24
+  mirror-sync incremental -a 2025-07-24 -b 2025-07-25 \
+    --cleanup-root /data/mirror/pypi/pypi-2025-07-24  # 指定删除脚本目标根目录
 `)
 }
 
@@ -272,7 +287,24 @@ func runCLI(cfg types.AppConfig) error {
 		fmt.Printf("  Skipped Existing: %d\n", len(result.Plan.SkippedExisting))
 	}
 	if result.Diff != nil {
-		fmt.Printf("  Added: %d, Changed: %d\n", len(result.Diff.Added), len(result.Diff.Changed))
+		fmt.Printf("  Packages: +%d / -%d\n", len(result.Diff.AddedPackages), len(result.Diff.RemovedPackages))
+		fmt.Printf("  Artifacts: added %d, changed %d, removed %d\n",
+			len(result.Diff.Added), len(result.Diff.Changed), len(result.Diff.Removed))
+	}
+	if result.DiffReportPath != nil {
+		fmt.Printf("  Diff Report: %s\n", *result.DiffReportPath)
+	}
+	if result.CleanupScriptPath != nil {
+		fmt.Printf("  Cleanup Script: %s (未执行, 请人工审查)\n", *result.CleanupScriptPath)
+	}
+	if result.RemovedPackageCount != nil {
+		fmt.Printf("  Removed Packages: %d\n", *result.RemovedPackageCount)
+	}
+	if result.RemovedArtifactCount != nil {
+		fmt.Printf("  Removed Artifacts: %d\n", *result.RemovedArtifactCount)
+	}
+	if result.RemovedArtifactSkippedCount != nil && *result.RemovedArtifactSkippedCount > 0 {
+		fmt.Printf("  ⚠ Removed Artifacts Skipped: %d (过滤/非 packages/ 路径, 不在脚本内)\n", *result.RemovedArtifactSkippedCount)
 	}
 	if result.DownloadSummary != nil {
 		fmt.Printf("  Downloaded: %d\n", result.DownloadSummary.Downloaded)

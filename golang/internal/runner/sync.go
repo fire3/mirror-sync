@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/user/mirror-sync/internal/config"
+	"github.com/user/mirror-sync/internal/core/cleanup"
 	"github.com/user/mirror-sync/internal/core/downloader"
 	"github.com/user/mirror-sync/internal/core/planner"
 	"github.com/user/mirror-sync/internal/core/storage"
@@ -225,7 +226,7 @@ func runArtifactDownload(cfg types.AppConfig, onEvent func(SyncEvent), tc types.
 	//   - Inter-package: up to 4 packages processed simultaneously
 	//   - Intra-package: each package's files use cfg.Base.Concurrency workers
 
-	const pipelineDepth = 4          // max concurrent packages in pipeline
+	const pipelineDepth = 4 // max concurrent packages in pipeline
 	pkgCh := make(chan types.PackageArtifactGroup, 50)
 	errCh := make(chan error, 1)
 	done := make(chan struct{})
@@ -467,10 +468,38 @@ func runArtifactDownload(cfg types.AppConfig, onEvent func(SyncEvent), tc types.
 	}, nil
 }
 
+// diffReportStats aggregates the diff counts for the report.
+type diffReportStats struct {
+	OldPackages      int `json:"oldPackages"`
+	NewPackages      int `json:"newPackages"`
+	AddedPackages    int `json:"addedPackages"`
+	RemovedPackages  int `json:"removedPackages"`
+	AddedArtifacts   int `json:"addedArtifacts"`
+	ChangedArtifacts int `json:"changedArtifacts"`
+	RemovedArtifacts int `json:"removedArtifacts"`
+	// RemovedArtifactsSkipped counts removals excluded from the cleanup
+	// script (filtered out or non-packages/ paths).
+	RemovedArtifactsSkipped int `json:"removedArtifactsSkipped"`
+}
+
+// diffReport is the structured snapshot-comparison report (diff-report.json).
+type diffReport struct {
+	OldSnapshotID    string                    `json:"oldSnapshotId"`
+	NewSnapshotID    string                    `json:"newSnapshotId"`
+	GeneratedAt      string                    `json:"generatedAt"`
+	Stats            diffReportStats           `json:"stats"`
+	RemovedPackages  []string                  `json:"removedPackages"`
+	AddedPackages    []string                  `json:"addedPackages"`
+	AddedArtifacts   []types.ArtifactRecord    `json:"addedArtifacts"`
+	ChangedArtifacts []types.ArtifactChange    `json:"changedArtifacts"`
+	RemovedArtifacts []cleanup.RemovedArtifact `json:"removedArtifacts"`
+}
+
 func runIncrementalDownload(cfg types.AppConfig, onEvent func(SyncEvent), tc types.Canceller) (types.SyncRunResult, error) {
 	oldDate := cfg.PyPI.IncrementalDownload.OldMetadataDate
 	newDate := cfg.PyPI.IncrementalDownload.NewMetadataDate
-	outputDate := cfg.PyPI.IncrementalDownload.OutputDate
+	outputDir := cfg.PyPI.IncrementalDownload.OutputDir
+	cleanupRoot := cfg.PyPI.IncrementalDownload.CleanupRoot
 
 	emit(onEvent, "Prepare", fmt.Sprintf("PyPI / %s", config.TaskLabel(types.PypiTaskIncrementalDownload)), nil)
 	emit(onEvent, "Load Manifest", fmt.Sprintf("Comparing %s -> %s", oldDate, newDate), nil)
@@ -483,21 +512,76 @@ func runIncrementalDownload(cfg types.AppConfig, onEvent func(SyncEvent), tc typ
 	if err != nil {
 		return types.SyncRunResult{}, fmt.Errorf("load new manifest: %w", err)
 	}
+	emit(onEvent, "Load Manifest",
+		fmt.Sprintf("Old: %d packages / %d artifacts; New: %d packages / %d artifacts",
+			len(oldManifest.Packages), len(oldManifest.Artifacts),
+			len(newManifest.Packages), len(newManifest.Artifacts)), nil)
 
-	outputRoot := config.BuildMirrorOutputRoot(cfg.Base.MirrorRoot, outputDate)
+	// ── Stage 1: Diff (artifact level + package level) ────────────────
 	diff := planner.DiffSnapshotManifests(oldManifest, newManifest)
+	emit(onEvent, "Diff",
+		fmt.Sprintf("Packages +%d/-%d; artifacts +%d/~%d/-%d",
+			len(diff.AddedPackages), len(diff.RemovedPackages),
+			len(diff.Added), len(diff.Changed), len(diff.Removed)), nil)
+
+	// ── Stage 2: Output roots ─────────────────────────────────────────
+	outputRoot := filepath.Join(cfg.Base.MirrorRoot, outputDir)
+	stateDir := filepath.Join(outputRoot, "state")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		return types.SyncRunResult{}, fmt.Errorf("mkdir state: %w", err)
+	}
+
+	// Same filter for downloads and for the cleanup script.
+	filter := pypi.DefaultFilterOptions
+
+	// ── Stage 3: Cleanup script (generated, never executed) ───────────
+	cleanupResult, err := cleanup.Generate(cleanup.Options{
+		Diff:        diff,
+		Filter:      filter,
+		CleanupRoot: cleanupRoot,
+		OldDate:     oldDate,
+		NewDate:     newDate,
+	})
+	if err != nil {
+		return types.SyncRunResult{}, fmt.Errorf("generate cleanup script: %w", err)
+	}
+	scriptPath := filepath.Join(outputRoot,
+		fmt.Sprintf("cleanup-%s-to-%s.sh", sanitizeFileName(oldDate), sanitizeFileName(newDate)))
+	if err := os.WriteFile(scriptPath, []byte(cleanupResult.Script), 0644); err != nil {
+		return types.SyncRunResult{}, fmt.Errorf("write cleanup script: %w", err)
+	}
+	removedArtifactsPath := filepath.Join(outputRoot, "removed-artifacts.jsonl")
+	if err := writeRemovedArtifacts(removedArtifactsPath, cleanupResult.Removed); err != nil {
+		return types.SyncRunResult{}, fmt.Errorf("write removed artifacts: %w", err)
+	}
+	if len(cleanupResult.Removed) > 0 {
+		emit(onEvent, "Cleanup",
+			fmt.Sprintf("Cleanup script written: %s (%d files, 未执行)", scriptPath, len(cleanupResult.Removed)), nil)
+	}
+	if cleanupResult.Skipped > 0 {
+		emit(onEvent, "Cleanup",
+			fmt.Sprintf("⚠ %d removed artifacts skipped (过滤/非 packages/ 路径), 不在脚本内", cleanupResult.Skipped), nil)
+	}
+
+	// ── Stage 4: Build plan (added + changed) & download ──────────────
 	plan := planner.BuildDownloadPlan(planner.BuildDownloadPlanOptions{
 		MirrorRoot:  outputRoot,
 		NewManifest: newManifest,
 		Diff:        &diff,
+		Filter:      &filter,
 	})
-
 	planPath, err := writePlan(cfg.Base.MetadataRoot, newDate,
-		fmt.Sprintf("incremental-plan-%s-to-%s.json", oldDate, outputDate), plan)
+		fmt.Sprintf("incremental-plan-%s-to-%s.json", sanitizeFileName(oldDate), sanitizeFileName(outputDir)), plan)
 	if err != nil {
 		return types.SyncRunResult{}, fmt.Errorf("write plan: %w", err)
 	}
 	emit(onEvent, "Build Plan", fmt.Sprintf("Planned %d incremental downloads -> %s", len(plan.Entries), outputRoot), nil)
+
+	stateStore, err := downloader.NewStateStore(stateDir)
+	if err != nil {
+		return types.SyncRunResult{}, fmt.Errorf("init state store: %w", err)
+	}
+	defer stateStore.Close()
 
 	downloadSummary := downloader.ExecuteDownloadPlan(plan, types.DownloaderOptions{
 		Concurrency:    cfg.Base.Concurrency,
@@ -510,36 +594,114 @@ func runIncrementalDownload(cfg types.AppConfig, onEvent func(SyncEvent), tc typ
 				&SyncProgress{Current: current, Total: total, Failed: failed, Active: active})
 		},
 	})
+	for _, f := range downloadSummary.Failed {
+		if f.NotFound {
+			_ = stateStore.RecordNotFound(f.Entry.Package, f.Entry.Filename, f.Entry.RelativePath, f.Entry.URL)
+		} else {
+			_ = stateStore.RecordFailed(f.Entry.Package, f.Entry.Filename, f.Entry.RelativePath, f.Error)
+		}
+	}
 	emit(onEvent, "Download",
 		fmt.Sprintf("Downloaded %d/%d, failed %d", downloadSummary.Downloaded, downloadSummary.Attempted, len(downloadSummary.Failed)),
 		nil)
 
-	// Write run-summary.json
+	// ── Stage 5: Write diff report & run summary ──────────────────────
+	report := diffReport{
+		OldSnapshotID: "pypi-" + oldDate,
+		NewSnapshotID: "pypi-" + newDate,
+		GeneratedAt:   time.Now().UTC().Format(time.RFC3339),
+		Stats: diffReportStats{
+			OldPackages:             len(oldManifest.Packages),
+			NewPackages:             len(newManifest.Packages),
+			AddedPackages:           len(diff.AddedPackages),
+			RemovedPackages:         len(diff.RemovedPackages),
+			AddedArtifacts:          len(diff.Added),
+			ChangedArtifacts:        len(diff.Changed),
+			RemovedArtifacts:        len(cleanupResult.Removed),
+			RemovedArtifactsSkipped: cleanupResult.Skipped,
+		},
+		RemovedPackages:  diff.RemovedPackages,
+		AddedPackages:    diff.AddedPackages,
+		AddedArtifacts:   diff.Added,
+		ChangedArtifacts: diff.Changed,
+		RemovedArtifacts: cleanupResult.Removed,
+	}
+	reportPath := filepath.Join(outputRoot, "diff-report.json")
+	if err := storage.WriteJSONFile(reportPath, report); err != nil {
+		return types.SyncRunResult{}, fmt.Errorf("write diff report: %w", err)
+	}
+
 	summaryData := map[string]interface{}{
-		"provider":       "pypi",
-		"taskType":       "incremental-download",
-		"oldMetadataDate": oldDate,
-		"newMetadataDate": newDate,
-		"outputDate":     outputDate,
-		"outputRoot":     outputRoot,
-		"planPath":       planPath,
+		"provider":                "pypi",
+		"taskType":                "incremental-download",
+		"oldMetadataDate":         oldDate,
+		"newMetadataDate":         newDate,
+		"outputDir":               outputDir,
+		"outputRoot":              outputRoot,
+		"cleanupRoot":             cleanupRoot,
+		"planPath":                planPath,
+		"diffReportPath":          reportPath,
+		"cleanupScriptPath":       scriptPath,
+		"removedArtifactsPath":    removedArtifactsPath,
+		"addedPackages":           len(diff.AddedPackages),
+		"removedPackages":         len(diff.RemovedPackages),
+		"addedArtifacts":          len(diff.Added),
+		"changedArtifacts":        len(diff.Changed),
+		"removedArtifacts":        len(cleanupResult.Removed),
+		"removedArtifactsSkipped": cleanupResult.Skipped,
+		"attempted":               downloadSummary.Attempted,
+		"downloaded":              downloadSummary.Downloaded,
+		"failed":                  len(downloadSummary.Failed),
 	}
 	if err := storage.WriteJSONFile(filepath.Join(outputRoot, "run-summary.json"), summaryData); err != nil {
 		return types.SyncRunResult{}, fmt.Errorf("write run-summary: %w", err)
 	}
 
-	emit(onEvent, "Finalize", fmt.Sprintf("Incremental download completed into %s", outputRoot), nil)
+	emit(onEvent, "Finalize",
+		fmt.Sprintf("Incremental download completed into %s; cleanup script: %s",
+			outputRoot, scriptPath), nil)
 
+	removedPkgCount := len(diff.RemovedPackages)
+	removedArtifactCount := len(cleanupResult.Removed)
+	removedArtifactSkipped := cleanupResult.Skipped
 	return types.SyncRunResult{
-		Provider:        types.ProviderTypePyPI,
-		TaskType:        types.PypiTaskIncrementalDownload,
-		SnapshotID:      &newDate,
-		Manifest:        &newManifest,
-		Plan:            &plan,
-		Diff:            &diff,
-		DownloadSummary: &downloadSummary,
-		OutputRoot:      &outputRoot,
+		Provider:                    types.ProviderTypePyPI,
+		TaskType:                    types.PypiTaskIncrementalDownload,
+		SnapshotID:                  &newDate,
+		Manifest:                    &newManifest,
+		Plan:                        &plan,
+		Diff:                        &diff,
+		DownloadSummary:             &downloadSummary,
+		OutputRoot:                  &outputRoot,
+		DiffReportPath:              &reportPath,
+		CleanupScriptPath:           &scriptPath,
+		RemovedPackageCount:         &removedPkgCount,
+		RemovedArtifactCount:        &removedArtifactCount,
+		RemovedArtifactSkippedCount: &removedArtifactSkipped,
 	}, nil
+}
+
+// sanitizeFileName neutralizes path separators so a user-supplied output dir
+// cannot inject directories into generated file names.
+func sanitizeFileName(s string) string {
+	r := strings.NewReplacer("/", "-", "\\", "-")
+	return r.Replace(s)
+}
+
+// writeRemovedArtifacts writes the removal list as newline-delimited JSON.
+func writeRemovedArtifacts(path string, removed []cleanup.RemovedArtifact) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	for _, r := range removed {
+		if err := enc.Encode(r); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // RunSync runs a sync task based on the config.

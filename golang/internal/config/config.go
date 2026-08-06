@@ -54,7 +54,10 @@ func DefaultConfig() types.AppConfig {
 			IncrementalDownload: types.IncrementalDownloadTaskConfig{
 				OldMetadataDate: "",
 				NewMetadataDate: "",
-				OutputDate:      snapshotID,
+				// OutputDir / CleanupRoot derive from the dates in
+				// NormalizeConfig; not preset here.
+				OutputDir:   "",
+				CleanupRoot: "",
 			},
 		},
 	}
@@ -144,7 +147,14 @@ func NormalizeConfig(cfg types.AppConfig) types.AppConfig {
 			IncrementalDownload: types.IncrementalDownloadTaskConfig{
 				OldMetadataDate: fallbackDate(cfg.PyPI.IncrementalDownload.OldMetadataDate),
 				NewMetadataDate: fallbackDate(cfg.PyPI.IncrementalDownload.NewMetadataDate),
-				OutputDate:      fallbackDate(cfg.PyPI.IncrementalDownload.OutputDate),
+				OutputDir: FallbackIncrementalOutputDir(
+					cfg.PyPI.IncrementalDownload.NewMetadataDate,
+					cfg.PyPI.IncrementalDownload.OldMetadataDate,
+					cfg.PyPI.IncrementalDownload.OutputDir),
+				CleanupRoot: FallbackCleanupRoot(
+					mirrorRoot,
+					cfg.PyPI.IncrementalDownload.OldMetadataDate,
+					cfg.PyPI.IncrementalDownload.CleanupRoot),
 			},
 		},
 	}
@@ -158,6 +168,26 @@ func FallbackOutputDir(metadataDate, outputDir string) string {
 		return trimmed
 	}
 	return "pypi-" + fallbackDate(metadataDate)
+}
+
+// FallbackIncrementalOutputDir returns the output directory name for
+// incremental download. If empty, it defaults to "pypi-diff-{new}-{old}".
+func FallbackIncrementalOutputDir(newDate, oldDate, outputDir string) string {
+	if trimmed := strings.TrimSpace(outputDir); trimmed != "" {
+		return trimmed
+	}
+	return "pypi-diff-" + fallbackDate(newDate) + "-" + fallbackDate(oldDate)
+}
+
+// FallbackCleanupRoot returns the cleanup script's target root directory.
+// If empty, it defaults to the old-date mirror directory. The old date is
+// normalized via fallbackDate so an empty value cannot produce a dangling
+// "<mirrorRoot>/pypi-" prefix.
+func FallbackCleanupRoot(mirrorRoot, oldDate, cleanupRoot string) string {
+	if trimmed := strings.TrimSpace(cleanupRoot); trimmed != "" {
+		return trimmed
+	}
+	return BuildMirrorOutputRoot(mirrorRoot, fallbackDate(oldDate))
 }
 
 func isFinite(f float64) bool {
@@ -193,8 +223,15 @@ func LoadConfig(configPath string) (types.AppConfig, error) {
 	if parsed.PyPI.ArtifactDownload.OutputDir == "" {
 		parsed.PyPI.ArtifactDownload.OutputDir = FallbackOutputDir(parsed.PyPI.ArtifactDownload.MetadataDate, "")
 	}
-	if parsed.PyPI.IncrementalDownload.OutputDate == "" {
-		parsed.PyPI.IncrementalDownload.OutputDate = def.PyPI.IncrementalDownload.OutputDate
+	if parsed.PyPI.IncrementalDownload.OutputDir == "" {
+		parsed.PyPI.IncrementalDownload.OutputDir = FallbackIncrementalOutputDir(
+			parsed.PyPI.IncrementalDownload.NewMetadataDate,
+			parsed.PyPI.IncrementalDownload.OldMetadataDate, "")
+	}
+	if parsed.PyPI.IncrementalDownload.CleanupRoot == "" {
+		parsed.PyPI.IncrementalDownload.CleanupRoot = FallbackCleanupRoot(
+			parsed.Base.MirrorRoot,
+			parsed.PyPI.IncrementalDownload.OldMetadataDate, "")
 	}
 
 	return NormalizeConfig(parsed), nil
